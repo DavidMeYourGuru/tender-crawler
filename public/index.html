@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tender Crawler – Ausschreibungs-Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>🛰️ Tender Crawler</h1>
+    <nav class="topnav">
+      <button id="tab-tenders" class="nav-tab active">Ausschreibungen</button>
+      <button id="tab-funding" class="nav-tab">Förder-Calls</button>
+      <button id="tab-funding-chat" class="nav-tab">Förder-Chat</button>
+    </nav>
+    <div class="topbar-actions">
+      <span id="status-badge" class="badge badge-idle">Bereit</span>
+      <button id="btn-refresh" class="btn" title="Ansicht aktualisieren">⟳</button>
+      <button id="btn-logout" class="btn btn-ghost" title="Token zurücksetzen">Logout</button>
+    </div>
+  </header>
+
+  <!-- Login-Overlay -->
+  <div id="login-overlay" class="overlay hidden">
+    <div class="login-card card">
+      <h2>Anmeldung</h2>
+      <p>Bitte den Zugriffs-Token eingeben (steht in der <code>.env</code> als <code>AUTH_TOKEN</code>).</p>
+      <form id="login-form">
+        <input id="token-input" type="password" placeholder="Zugriffs-Token" autocomplete="off" required />
+        <button type="submit" class="btn">Anmelden</button>
+      </form>
+      <p id="login-error" class="error hidden">Token ungültig.</p>
+    </div>
+  </div>
+
+  <main id="app" class="hidden">
+    <!-- Statistik-Karten -->
+    <section class="stats-grid">
+      <div class="card stat-card">
+        <span class="stat-label">Offene Ausschreibungen</span>
+        <span id="stat-total-open" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Neu heute</span>
+        <span id="stat-new-today" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Neu (7 Tage)</span>
+        <span id="stat-new-7d" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Frist in 7 Tagen</span>
+        <span id="stat-closing-week" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Frist in 30 Tagen</span>
+        <span id="stat-closing-month" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">LLM-analysiert</span>
+        <span id="stat-analyzed" class="stat-value">–</span>
+      </div>
+    </section>
+
+    <!-- Aktionen -->
+    <section class="actions card">
+      <button id="btn-crawl" class="btn btn-primary">Crawl starten</button>
+      <span id="job-status" class="action-msg hidden"></span>
+      <button id="btn-cancel-job" class="btn btn-ghost hidden">Abbruch</button>
+      <span id="action-msg" class="action-msg"></span>
+    </section>
+
+    <!-- Filter -->
+    <section class="filters card">
+      <input id="filter-q" type="search" placeholder="Suche (Titel, Beschreibung, CPV …)" />
+      <select id="filter-source">
+        <option value="">Alle Quellen</option>
+      </select>
+      <select id="filter-region">
+        <option value="">Alle Regionen</option>
+        <option value="eu">EU</option>
+        <option value="de">Deutschland</option>
+        <option value="bayern">Bayern</option>
+      </select>
+      <select id="filter-status">
+        <option value="">Alle Status</option>
+        <option value="open">Offen</option>
+        <option value="closing_soon">Frist bald</option>
+        <option value="closed">Geschlossen</option>
+      </select>
+      <input id="filter-cpv" type="text" placeholder="CPV-Code, z. B. 38000000" />
+      <select id="filter-sort">
+        <option value="newest">Neueste zuerst</option>
+        <option value="deadline">Frist (bald zuerst)</option>
+        <option value="value_desc">Wert (hoch zuerst)</option>
+        <option value="relevance">Relevanz (LLM)</option>
+      </select>
+      <button id="btn-apply-filters" class="btn">Anwenden</button>
+    </section>
+
+    <!-- Tender-Liste -->
+    <section class="card">
+      <h2>Ausschreibungen <span id="tender-count" class="count"></span></h2>
+      <div id="tender-list" class="tender-list"></div>
+      <div id="pagination" class="pagination"></div>
+    </section>
+
+    <!-- Crawl-Log -->
+    <section class="card">
+      <h2>Letzte Crawls</h2>
+      <div id="crawl-log" class="crawl-log"></div>
+    </section>
+  </main>
+
+  <!-- ── Förderprogramme ── -->
+  <main id="funding-app" class="hidden">
+    <!-- Statistik-Karten -->
+    <section class="stats-grid">
+      <div class="card stat-card">
+        <span class="stat-label">Offene Calls</span>
+        <span id="f-stat-open" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Gesamt</span>
+        <span id="f-stat-total" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Prüfbedürftig</span>
+        <span id="f-stat-review" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Verifiziert</span>
+        <span id="f-stat-verified" class="stat-value">–</span>
+      </div>
+      <div class="card stat-card">
+        <span class="stat-label">Frist in 30 Tagen</span>
+        <span id="f-stat-closing" class="stat-value">–</span>
+      </div>
+    </section>
+
+    <!-- Aktionen -->
+    <section class="actions card">
+      <button id="btn-funding-crawl" class="btn btn-primary">Förder-Crawl starten</button>
+      <span id="funding-action-msg" class="action-msg"></span>
+    </section>
+
+    <!-- Filter -->
+    <section class="filters card">
+      <input id="f-filter-q" type="search" placeholder="Volltextsuche (Titel, Call, Fördergegenstand, Bekanntmachungstext …)" />
+      <input id="f-filter-geber" type="search" placeholder="Fördergeber" />
+      <select id="f-filter-status">
+        <option value="">Alle Status</option>
+        <option value="open">Offen</option>
+        <option value="ongoing">Laufend</option>
+        <option value="closed">Geschlossen</option>
+        <option value="unknown">Unbekannt</option>
+      </select>
+      <select id="f-filter-review">
+        <option value="">Alle Prüfstatus</option>
+        <option value="unreviewed">Ungeprüft</option>
+        <option value="needs_review">Prüfbedürftig</option>
+        <option value="verified">Verifiziert</option>
+      </select>
+      <input id="f-filter-project-type" type="search" placeholder="Projektform, z. B. Machbarkeitsprojekte" />
+      <select id="f-filter-sort">
+        <option value="deadline">Nächste Frist</option>
+        <option value="newest">Neueste zuerst</option>
+        <option value="title">Titel (A-Z)</option>
+      </select>
+      <button id="btn-funding-apply" class="btn">Anwenden</button>
+    </section>
+
+    <!-- Förder-Call-Liste -->
+    <section class="card">
+      <h2>Förder-Calls <span id="funding-count" class="count"></span></h2>
+      <div id="funding-program-list" class="tender-list"></div>
+      <div id="funding-pagination" class="pagination"></div>
+    </section>
+
+    <!-- Förder-Crawl-Log -->
+    <section class="card">
+      <h2>Letzte Förder-Crawls</h2>
+      <div id="funding-crawl-log" class="crawl-log"></div>
+    </section>
+
+    <!-- Quelle (fest: Förderinfo) -->
+    <section class="card">
+      <h2>Förderquelle</h2>
+      <div id="source-list" class="source-list"></div>
+      <button id="btn-source-refresh" class="btn btn-ghost">Neu laden</button>
+      <span id="source-msg" class="action-msg"></span>
+    </section>
+  </main>
+
+  <!-- ── Förder-Chat ── -->
+  <main id="funding-chat-app" class="hidden">
+    <section class="chat-layout">
+      <aside class="card chat-profile-card">
+        <h2>Grundprofil</h2>
+        <p class="chat-hint">Beschreibt deine Organisation und Interessen. Wird bei jeder Frage berücksichtigt; projektspezifische Details ergänzt du direkt im Chat.</p>
+        <textarea id="chat-profile" rows="8" placeholder="z. B. Angewandte Forschungseinrichtung (30 Beschäftigte) im Bereich Wasserstoff-Elektrolyse, Sitz in Deutschland, Verbundpartner möglich, Budget je Projekt bis 500.000 € …"></textarea>
+        <button id="btn-chat-profile-save" class="btn btn-primary">Profil speichern</button>
+        <span id="chat-profile-msg" class="action-msg"></span>
+      </aside>
+
+      <section class="card chat-main-card">
+        <div class="chat-header">
+          <h2>Förder-Chat</h2>
+          <button id="btn-chat-new" class="btn btn-ghost" title="Unterhaltung zurücksetzen">Neue Unterhaltung</button>
+        </div>
+        <div id="chat-messages" class="chat-messages"></div>
+        <form id="chat-form" class="chat-input-row">
+          <textarea id="chat-input" rows="2" placeholder="Frage stellen, z. B. „Welche offenen Calls passen zu einem Verbundprojekt für Wasserstoff-Elektrolyse?“" required></textarea>
+          <button type="submit" id="btn-chat-send" class="btn btn-primary">Senden</button>
+        </form>
+        <span id="chat-status" class="action-msg"></span>
+      </section>
+    </section>
+  </main>
+
+  <!-- Detail-Overlay -->
+  <div id="detail-overlay" class="overlay hidden">    <div class="detail-card card">
+      <button id="btn-close-detail" class="btn btn-ghost close-btn">✕</button>
+      <div id="detail-content"></div>
+    </div>
+  </div>
+
+  <!-- Förderprogramm-Detail-Overlay -->
+  <div id="funding-detail-overlay" class="overlay hidden">
+    <div class="detail-card card">
+      <button id="btn-close-funding-detail" class="btn btn-ghost close-btn">✕</button>
+      <div id="funding-detail-content"></div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20260801-noauth-init"></script>
+</body>
+</html>
