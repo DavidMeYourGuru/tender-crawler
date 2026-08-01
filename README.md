@@ -220,4 +220,4 @@ tender-crawler/
 - Der User-Agent identifiziert den Crawler eindeutig.
 - Pro Portal gilt ein konfigurierbarer Rate-Limiter (Standard: 40 req/min global).
 - Zwischen Requests wird eine Verzögerung eingehalten (`REQUEST_DELAY_MS`).
-- Die Portale werden regelmäßig aktualisiert – bei Fragen zu Datenquellen die jeweiligen Nutzungsbedingungen beachten.
+- Die Portale werden regelmäßig aktualisiert – bei Fragen zu Datenquellen die jeweiligen Nutzungsbedingungen beachten.# tender-crawler
