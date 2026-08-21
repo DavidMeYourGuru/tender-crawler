@@ -625,6 +625,8 @@ const seedSources = db.transaction(() => {
     ['evergabe', 'eVergabe Online (Vergabeplattform des Bundes)', 'de', 'html', 480, 1],
     ['bayern', 'Vergabe Bayern (auftraege.bayern.de)', 'bayern', 'html', 480, 0],
     ['dtvp', 'Deutsches Vergabeportal (dtvp.de)', 'de', 'html', 480, 1],
+    ['nrw', 'Vergabemarktplatz NRW (evergabe.nrw.de)', 'nrw', 'html', 480, 1],
+    ['niedersachsen', 'Vergabeportal Niedersachsen (Deutsche eVergabe)', 'niedersachsen', 'browser', 480, 1],
   ];
   for (const [id, name, region, type, interval, enabled] of sources) {
     insert.run(id, name, region, type, interval, enabled);
@@ -640,6 +642,8 @@ const seedSources = db.transaction(() => {
 
   // eVergabe läuft jetzt über den Browser-Worker
   db.prepare(`UPDATE sources SET type = 'browser' WHERE id = 'evergabe'`).run();
+  // Niedersachsen (Deutsche eVergabe) läuft über den Browser-Worker
+  db.prepare(`UPDATE sources SET type = 'browser' WHERE id = 'niedersachsen'`).run();
 });
 seedSources();
 

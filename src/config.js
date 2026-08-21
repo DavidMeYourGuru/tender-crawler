@@ -48,7 +48,7 @@ export const config = {
   // Request-Verhalten
   requestTimeoutMs: asPositiveInt(process.env.REQUEST_TIMEOUT_MS, 30000),
   requestDelayMs: asPositiveInt(process.env.REQUEST_DELAY_MS, 1200),
-  maxRequestsPerMinute: asPositiveInt(process.env.MAX_REQUESTS_PER_MINUTE, 40),
+  maxRequestsPerMinute: asPositiveInt(process.env.MAX_REQUESTS_PER_MINUTE, 20),
   maxResultsPerPortal: asPositiveInt(process.env.MAX_RESULTS_PER_PORTAL, 250),
 
   // TED API: Suche über zurückliegende Tage

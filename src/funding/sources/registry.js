@@ -8,7 +8,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -22,7 +22,7 @@ export async function loadFundingSources() {
   const sources = new Map();
   for (const file of files) {
     try {
-      const module = await import(path.join(__dirname, file));
+      const module = await import(pathToFileURL(path.join(__dirname, file)).href);
       if (module.meta?.id && typeof module.discover === 'function') {
         sources.set(module.meta.id, module);
       }

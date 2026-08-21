@@ -11,10 +11,12 @@ import {
 } from './db.js';
 import { sleep } from './utils.js';
 import { runEvergabeJob } from './browser-portals/evergabe.js';
+import { runNiedersachsenJob } from './browser-portals/niedersachsen.js';
 import { runGenericBrowserSource } from './discovery/browser.js';
 
 const runners = {
   evergabe: runEvergabeJob,
+  niedersachsen: runNiedersachsenJob,
 };
 
 /**

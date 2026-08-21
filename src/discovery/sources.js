@@ -13,6 +13,7 @@ import {
   addCrawlSource,
   listCrawlSources,
   getCrawlSource,
+  getCrawlSourceByKey,
   setCrawlSourceState,
   recordSourceRun,
   addDiscoveredDocument,
@@ -52,6 +53,18 @@ export function seedCrawlSources() {
     }
     added += 1;
   }
+
+  // Referenz-Quellen, die nicht in den Interessenbereich passen (FuE-Förderung
+  // statt Bau/Garten/Schule/Kita/Spielplatz), bleiben als Deaktivierte
+  // Referenz erhalten – sie werden vom Crawl übersprungen (state != 'active').
+  const DISABLED_REFERENCE_SOURCES = ['zim-ausschreibungen', 'bbsr-ausschreibungen', 'bayfor-ausschreibungen'];
+  for (const key of DISABLED_REFERENCE_SOURCES) {
+    const source = getCrawlSourceByKey(key);
+    if (source) {
+      setCrawlSourceState(source.id, 'reference');
+    }
+  }
+
   return added;
 }
 

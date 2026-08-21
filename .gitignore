@@ -1,5 +1,52 @@
+# Dependencies
 node_modules/
-data/
+
+# Environment / Secrets
 .env
+.env.local
+.env.*.local
+*.pem
+
+# Datenbank & Crawl-Daten (SQLite + WAL/SHM, gecrawlte Dokumente)
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test- & Coverage-Artefakte
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+blob-report/
+
+# Build / Dist
+dist/
+build/
+out/
+
+# Cache & temporäre Dateien
+.cache/
+.tmp/
+tmp/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+
+# Projekt-spezifische Scratch-/Validierungsdateien
+validate.cjs
+validate2.cjs
+validation-output.txt
+validation-summary.txt
+zim-pw2.mjs
