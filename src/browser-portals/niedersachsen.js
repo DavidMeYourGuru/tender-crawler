@@ -140,7 +140,7 @@ async function getNextPageNumber(page, currentPage) {
         .filter((n) => Number.isInteger(n));
       if (!numbers.length) return null;
       const maxPage = Math.max(...numbers);
-      return currentPage < maxPage ? currentPage + 1 : null;
+      return cp < maxPage ? cp + 1 : null;
     },
     { pagerSelector: PAGER_SELECTOR, pageLinkSelector: PAGE_LINK_SELECTOR, currentPage }
   );

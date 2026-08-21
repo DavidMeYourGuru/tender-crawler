@@ -9,6 +9,10 @@ import { config } from '../config.js';
 export const httpClient = axios.create({
   timeout: config.requestTimeoutMs,
   maxRedirects: 5,
+  // Rohbytes holen, damit wir den Charset aus dem Content-Type selbst
+  // korrekt dekodieren können (manche Portale liefern ISO-8859-1, was
+  // axios sonst als UTF-8 verstümmelt – siehe Response-Interceptor).
+  responseType: 'arraybuffer',
   headers: {
     'User-Agent': config.userAgent,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7',
@@ -16,6 +20,28 @@ export const httpClient = axios.create({
   },
   validateStatus: (status) => status >= 200 && status < 400,
 });
+
+/**
+ * Dekodiert einen rohen Response-Body unter Beachtung des Charsets.
+ * - UTF-8 (Default) → utf8
+ * - ISO-8859-1 / latin1 / windows-1252 → latin1 (1:1 Byte-Mapping,
+ *   für deutsche Umlaute identisch)
+ */
+function decodeBody(data, contentType = '') {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const ct = contentType.toLowerCase();
+  const charsetMatch = ct.match(/charset=([^;]+)/);
+  const charset = charsetMatch ? charsetMatch[1].trim().toLowerCase() : 'utf-8';
+  if (charset === 'utf-8' || charset === 'utf8') {
+    return buf.toString('utf8');
+  }
+  return buf.toString('latin1');
+}
+
+// Textuelle Content-Types, die dekodiert werden sollen (Binär wie PDF/Bilder
+// bleibt als Buffer unangetastet).
+const TEXT_CONTENT_RE = /^(text\/|application\/(json|xml|xhtml\+xml|javascript|ld\+json|atom\+xml|rss\+xml))/i;
+const JSON_CONTENT_RE = /application\/(json|ld\+json)/i;
 
 // Einfacher Cookie-Jar: Hostname -> Map(name -> value)
 const cookieJar = new Map();
@@ -67,6 +93,19 @@ httpClient.interceptors.request.use((requestConfig) => {
 httpClient.interceptors.response.use(
   (response) => {
     storeCookies(response);
+    const data = response.data;
+    // Nur rohe Bytes (Buffer/ArrayBuffer) dekodieren – Binärantworten
+    // (PDF, Bilder) und bereits als String vorliegende Antworten unverändert.
+    if (Buffer.isBuffer(data) || data instanceof ArrayBuffer) {
+      const ct = response.headers?.['content-type'] || '';
+      if (JSON_CONTENT_RE.test(ct)) {
+        // JSON wieder als Objekt zurückgeben (axios default-Verhalten),
+        // aber charset-bewusst dekodiert.
+        response.data = JSON.parse(decodeBody(data, ct));
+      } else if (TEXT_CONTENT_RE.test(ct) || ct.includes('html')) {
+        response.data = decodeBody(data, ct);
+      }
+    }
     return response;
   },
   (error) => {

@@ -51,6 +51,16 @@ const INTEREST_CPV_CODES = [
 const BOILERPLATE = 'Informationen werden in einem neuen Tab geöffnet';
 
 /**
+ * Dekodiert HTML-Entitäten. Die NRW-Seite kodiert teils doppelt
+ * (z. B. &amp;#39;), sodass ein einfacher cheerio-Text-Extrakt noch
+ * Rest-Entitäten enthalten kann. Ein zweiter Parse-Pass dekodiert diese.
+ */
+function decodeEntities(str) {
+  if (!str) return str;
+  return cheerio.load(`<div>${str}</div>`).text();
+}
+
+/**
  * Parst die Treffer-Tabelle einer showTable-Seite.
  * Spalten (cosinex VMP): 0 Veröffentlichung, 1 Frist, 2 Titel,
  * 3 Verfahrenstyp, 4 Vergabestelle, 5 (Dokument-Link).
@@ -73,26 +83,27 @@ export function parseResultsTable(html, baseUrl = meta.baseUrl) {
     const cellTexts = cells.map((_, td) => $(td).text().replace(/\s+/g, ' ').trim()).get();
 
     // Titel: Link-Text (Boilerplate entfernt) oder längste nicht-Datum-Zelle
-    let title = link.text().replace(BOILERPLATE, '').replace(/\s+/g, ' ').trim();
+    let title = decodeEntities(link.text().replace(BOILERPLATE, '').replace(/\s+/g, ' ').trim());
     if (!title) {
       title = cellTexts
         .filter((t) => t && !normalizeDate(t))
         .sort((a, b) => b.length - a.length)[0] || 'Ohne Titel';
     }
+    title = decodeEntities(String(title).trim());
 
     const url = new URL(href, baseUrl).toString();
     const externalId = url.match(/[?&]pid=([^&]+)/)?.[1] || url.match(/[?&]id=([^&]+)/)?.[1] || contentHash(url);
 
     const publicationDate = normalizeDate(cellTexts[0]);
     const deadline = normalizeDate(cellTexts[1]) || normalizeDate(cellTexts[2]);
-    const tenderType = cellTexts[3] || null;
-    const contractingAuthority = cellTexts[4] || null;
+    const tenderType = decodeEntities(cellTexts[3] || '');
+    const contractingAuthority = decodeEntities(cellTexts[4] || '');
     const status = deriveStatus(deadline, 'open');
 
     results.push({
       sourceId: 'nrw',
       externalId: String(externalId),
-      title: String(title).trim(),
+      title,
       url,
       description: null,
       contractingAuthority,

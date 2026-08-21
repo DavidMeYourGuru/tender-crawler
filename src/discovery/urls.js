@@ -102,7 +102,9 @@ export async function fetchSafeHtml(url, { maxRedirects = 5, timeout = 20000 } =
     const u = assertSafeUrl(current);
     const response = await httpClient.get(u.toString(), {
       maxRedirects: 0,
-      responseType: 'text',
+      // arraybuffer (statt 'text'), damit der Response-Interceptor den
+      // Charset aus dem Content-Type korrekt dekodiert (z. B. ISO-8859-1).
+      responseType: 'arraybuffer',
       timeout,
       validateStatus: () => true,
     });

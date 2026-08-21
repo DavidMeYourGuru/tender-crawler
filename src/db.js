@@ -8,7 +8,10 @@ fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 export const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000');
+// Hohes busy_timeout: Worker (Browser-Jobs) und Crawler können als
+// separate Prozesse gleichzeitig auf dieselbe SQLite-Datei schreiben;
+// bei Sperren wird gewartet statt sofort mit "database is locked" abzubrechen.
+db.pragma('busy_timeout = 60000');
 
 db.exec(`
 -- Quellen (Portale)
