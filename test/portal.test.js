@@ -123,20 +123,34 @@ test('dtvp.parseProject extrahiert Ausschreibungsdaten', () => {
     projectId: 1486847,
     title: 'Teilaustausch defekte Ventilationsleitungen',
     publishingDate: '31.07.2026',
-    relevantDate: '19.08.2026',
+    relevantDate: '19.08.2027',
     organisationName: 'Ärztekammer Berlin',
     contractingRule: 'VOB/A',
     publicationType: 'Ausschreibung',
+    cpvCodes: ['45000000-7', '45331000-6'],
+    cpvLabels: ['Bauarbeiten', 'Installation von Heizungsanlagen'],
     links: { enterprojectroom: 'https://www.dtvp.de/Center/public/company/projectForwarding.do?pid=1486847' },
   });
   assert.equal(tender.sourceId, 'dtvp');
   assert.equal(tender.externalId, '1486847');
   assert.equal(tender.title, 'Teilaustausch defekte Ventilationsleitungen');
-  assert.equal(tender.submissionDeadline, '2026-08-19');
+  assert.equal(tender.submissionDeadline, '2027-08-19');
   assert.equal(tender.publicationDate, '2026-07-31');
   assert.equal(tender.contractingAuthority, 'Ärztekammer Berlin');
   assert.equal(tender.tenderType, 'VOB/A');
   assert.equal(tender.status, 'open');
+  assert.deepEqual(tender.cpvCodes, ['45000000', '45331000']);
+  assert.deepEqual(tender.cpvLabels, ['Bauarbeiten', 'Installation von Heizungsanlagen']);
+});
+
+test('dtvp.parseProject liefert null-Codes ohne CPV', () => {
+  const tender = dtvp.parseProject({
+    projectId: 99,
+    title: 'ohne CPV',
+    links: { enterprojectroom: 'https://www.dtvp.de/x' },
+  });
+  assert.equal(tender.cpvCodes, null);
+  assert.equal(tender.cpvLabels, null);
 });
 
 test('dtvp.parseProject überspringt Einträge ohne projectId', () => {

@@ -63,9 +63,9 @@ export function parseSearchPage(html, baseUrl = meta.baseUrl) {
     const authorityMatch = text.match(/(?:Auftraggeber|Vergabestelle|Beschaffungsstelle)\s*:\s*([^\n|]{3,120})/i);
     const contractingAuthority = authorityMatch ? authorityMatch[1].trim() : null;
 
-    // CPV-Code
-    const cpvMatch = text.match(/(?:CPV|cpv)\s*-?\s*code\s*:\s*([\d\s]+)/i) || text.match(/\b(\d{8})\b/);
-    const cpvCode = cpvMatch ? cpvMatch[1].replace(/\s/g, '') : null;
+    // CPV-Code – nur mit explizitem "CPV"-Kontext, um Falschtreffer zu vermeiden.
+    const cpvMatch = text.match(/(?:CPV|cpv|CPV-Code)\D{0,20}?([\d\s-]{7,11})/i);
+    const cpvCode = cpvMatch ? cpvMatch[1].replace(/\D/g, '').slice(0, 8) : null;
 
     // Auftragswert
     const moneyMatch = text.match(/(?:Wert|Auftragswert|geschätzter Wert)\s*:\s*([\d.\s.,]+)\s*(?:EUR|€)/i);

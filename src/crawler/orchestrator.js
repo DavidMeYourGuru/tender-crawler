@@ -6,6 +6,7 @@ import {
   updateSourceCrawlTime,
   startCrawlLog,
   finishCrawlLog,
+  updateCrawlDetailMetrics,
   getTenderById,
   enqueueBrowserJob,
 } from '../db.js';
@@ -18,6 +19,19 @@ import { processDiscoveredInbox } from '../discovery/pipeline.js';
 const registry = new RateLimiterRegistry(new RateLimiter(config.maxRequestsPerMinute, 60000));
 let activeCrawl = null;
 let crawlState = { running: false, message: 'Noch kein Crawl in diesem Prozess.', startedAt: null };
+
+const DETAIL_REFRESH_OPEN_MS = 24 * 60 * 60 * 1000;
+const DETAIL_REFRESH_CLOSED_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function isDetailDue(tender, now = Date.now()) {
+  if (!tender?.detail_crawled_at || tender.detail_status !== 'complete') return true;
+  const crawledAt = Date.parse(tender.detail_crawled_at);
+  if (!Number.isFinite(crawledAt)) return true;
+  const lastChanged = Date.parse(tender.last_changed_at || '');
+  if (Number.isFinite(lastChanged) && lastChanged > crawledAt) return true;
+  const maxAge = tender.status === 'closed' ? DETAIL_REFRESH_CLOSED_MS : DETAIL_REFRESH_OPEN_MS;
+  return now - crawledAt >= maxAge;
+}
 
 /**
  * Führt fn mit exponentiellem Backoff bis zu `retries` Mal aus.
@@ -107,40 +121,76 @@ export async function enqueueBrowserCrawlJobs({ sources: sourceIds = null } = {}
 }
 
 /**
- * Ruft Detailseiten für neue/geänderte Tender ab (Enrich-Phase).
- * Ergänzt fehlende Beschreibung/Dokument-URLs und protokolliert Änderungen.
+ * Ruft Detailseiten für neue/geänderte Tender ab (Enrich-Phase). Moderne
+ * Adapter liefern dabei ein vollständiges Detail-Bundle; ältere Adapter
+ * bleiben mit dem kleinen Detailvertrag kompatibel.
  */
-export async function enrichTenders(tenderIds) {
+export async function enrichTenders(tenderIds, { force = false, crawlLogIds = null } = {}) {
   const portals = await loadPortalModules();
   let enriched = 0;
+  const metricsBySource = new Map();
+  const metricsFor = (sourceId) => {
+    if (!metricsBySource.has(sourceId)) metricsBySource.set(sourceId, {
+      detailPagesSuccess: 0, detailPagesFailed: 0, tendersComplete: 0,
+      tendersPartial: 0, documentsInventoried: 0, messagesInventoried: 0,
+      loginRequired: 0, unknownPortalStructure: 0,
+    });
+    return metricsBySource.get(sourceId);
+  };
   for (const id of tenderIds) {
     const tender = getTenderById(id);
     if (!tender) continue;
     const portalModule = portals.get(tender.source_id);
-    if (!portalModule?.fetchDetail) continue;
+    if (!portalModule?.fetchDetail && !portalModule?.fetchDetailBundle) continue;
 
-    // Keine Lücken → kein Netzwerkzugriff nötig
-    if (tender.description && tender.document_url) continue;
-
-    const rateLimit = portalModule.meta?.rateLimit || { maxRequests: 15, windowMs: 60000 };
-    const limiter = registry.for(tender.source_id, rateLimit.maxRequests, rateLimit.windowMs);
+    // Ein erfolgreich gespeicherter Vollcrawl ist idempotent. Alte Datensätze
+    // ohne Detailstatus werden einmalig nachangereichert.
+    if (!force && !isDetailDue(tender)) continue;
 
     try {
-      // Rate-Limit-Slot vor dem Detail-Abruf (der Rate-Limiter übernimmt das Pacing)
-      await limiter.acquire();
-      const detail = await portalModule.fetchDetail(tender.url, { rateLimiter: limiter });
-      if (!detail) continue;
+      const rateLimit = portalModule.meta?.rateLimit || { maxRequests: 15, windowMs: 60000 };
+      const limiter = registry.for(tender.source_id, rateLimit.maxRequests, rateLimit.windowMs);
+      const fetchDetail = portalModule.fetchDetailBundle || portalModule.fetchDetail;
+      const detail = await fetchDetail(tender.url, {
+        rateLimiter: limiter,
+        crawlKind: 'full',
+        fullCrawlSucceeded: true,
+      });
+      if (!detail) {
+        metricsFor(tender.source_id).detailPagesFailed += 1;
+        continue;
+      }
+      const detailMetrics = metricsFor(tender.source_id);
+      detailMetrics.detailPagesSuccess += 1;
+      detailMetrics.documentsInventoried += detail.detailBundle?.documents?.length || 0;
+      detailMetrics.messagesInventoried += detail.detailBundle?.messages?.length || 0;
+      if (detail.detailBundle?.completeness?.overall === 'complete') detailMetrics.tendersComplete += 1;
+      else detailMetrics.tendersPartial += 1;
+      if (detail.portalMetadata?.loginRequired || detail.detailBundle?.metadata?.loginRequired) detailMetrics.loginRequired += 1;
+      if (detail.detailBundle?.completeness?.sections
+        && Object.values(detail.detailBundle.completeness.sections).some((value) => String(value).startsWith('unknown_structure'))) {
+        detailMetrics.unknownPortalStructure += 1;
+      }
 
       // Nur Lücken füllen – so bleibt der Enrich-Schritt idempotent und
       // verhindert Pendeln zwischen Kurz- und Langbeschreibung
-      const description = !tender.description && detail.description
+      const description = detail.description
         ? detail.description.trim()
         : tender.description;
-      const documentUrl = !tender.document_url && detail.documentUrl
-        ? detail.documentUrl
-        : tender.document_url;
-      // Nur speichern, wenn sich tatsächlich etwas ändert
-      if (description === tender.description && documentUrl === tender.document_url) continue;
+      const documentUrl = detail.documentUrl || tender.document_url;
+      // CPV nur nachladen, wenn bisher fehlend (Detail liefert es evtl. nach).
+      const existingCpvCodes = tender.cpv_codes ? JSON.parse(tender.cpv_codes) : null;
+      const existingCpvLabels = tender.cpv_labels ? JSON.parse(tender.cpv_labels) : null;
+      // Bei NRW kommen die CPVs erst aus der Detailseite. Sie ersetzen dort
+      // auch ältere, fälschlich aus der Suchkategorie übernommene Werte.
+      const hasDetailCpvCodes = Array.isArray(detail.cpvCodes) && detail.cpvCodes.length > 0;
+      const hasDetailCpvLabels = Array.isArray(detail.cpvLabels) && detail.cpvLabels.length > 0;
+      const cpvCodes = hasDetailCpvCodes ? detail.cpvCodes : existingCpvCodes;
+      const cpvLabels = hasDetailCpvLabels ? detail.cpvLabels : existingCpvLabels;
+      const hasBundle = Boolean(detail.detailBundle || detail.bundle);
+      if (!hasBundle && description === tender.description && documentUrl === tender.document_url
+        && JSON.stringify(cpvCodes) === JSON.stringify(existingCpvCodes)
+        && JSON.stringify(cpvLabels) === JSON.stringify(existingCpvLabels)) continue;
 
       const updated = {
         sourceId: tender.source_id,
@@ -148,20 +198,31 @@ export async function enrichTenders(tenderIds) {
         title: tender.title,
         url: tender.url,
         description,
-        contractingAuthority: tender.contracting_authority,
-        cpvCodes: tender.cpv_codes ? JSON.parse(tender.cpv_codes) : null,
-        cpvLabels: tender.cpv_labels ? JSON.parse(tender.cpv_labels) : null,
-        estimatedValueCents: tender.estimated_value_cents,
-        estimatedValueCurrency: tender.estimated_value_currency,
-        placeOfPerformance: tender.place_of_performance,
-        awardCriteria: null,
-        tenderType: tender.tender_type,
-        publicationDate: tender.publication_date,
-        submissionDeadline: tender.submission_deadline,
-        openingDate: null,
-        contractDuration: null,
+        contractingAuthority: detail.contractingAuthority || tender.contracting_authority,
+        cpvCodes,
+        cpvLabels,
+        estimatedValueCents: detail.estimatedValueCents ?? tender.estimated_value_cents,
+        estimatedValueCurrency: detail.estimatedValueCurrency || tender.estimated_value_currency,
+        placeOfPerformance: detail.placeOfPerformance || tender.place_of_performance,
+        awardCriteria: detail.awardCriteria || tender.award_criteria,
+        tenderType: detail.tenderType || tender.tender_type,
+        procedureType: detail.procedureType || tender.procedure_type,
+        referenceNumber: detail.referenceNumber || tender.reference_number,
+        portalProjectId: detail.portalProjectId || tender.portal_project_id,
+        publicationDate: detail.publicationDate || tender.publication_date,
+        submissionDeadline: detail.submissionDeadline || tender.submission_deadline,
+        questionDeadline: detail.questionDeadline || tender.question_deadline,
+        openingDate: detail.openingDate || tender.opening_date,
+        contractDuration: detail.contractDuration || tender.contract_duration,
         documentUrl,
         status: tender.status,
+        detailStatus: detail.detailStatus,
+        detailCrawlKind: detail.crawlKind || detail.detailBundle?.crawlKind || 'full',
+        fullCrawlSucceeded: detail.fullCrawlSucceeded ?? detail.detailBundle?.fullCrawlSucceeded ?? true,
+        detailCrawledAt: detail.detailCrawledAt,
+        detailCompleteness: detail.detailCompleteness,
+        portalMetadata: detail.portalMetadata,
+        detailBundle: detail.detailBundle || detail.bundle,
         contentHash: contentHash(
           tender.external_id,
           tender.title,
@@ -174,8 +235,13 @@ export async function enrichTenders(tenderIds) {
       saveTender(updated);
       enriched += 1;
     } catch (error) {
+      metricsFor(tender.source_id).detailPagesFailed += 1;
       console.error(`[enrich] Detail für Tender ${id} (${tender.title}) fehlgeschlagen:`, error.message);
     }
+  }
+  for (const [sourceId, metrics] of metricsBySource) {
+    const logId = crawlLogIds?.[sourceId];
+    if (logId) updateCrawlDetailMetrics({ id: logId, ...metrics });
   }
   return enriched;
 }
@@ -208,7 +274,10 @@ async function doCrawl({ sourceIds, enrich }) {
   if (enrich) {
     const enrichable = summaries.flatMap((s) => s.tenderIds || []);
     if (enrichable.length) {
-      enriched = await enrichTenders(enrichable);
+      const crawlLogIds = Object.fromEntries(
+        summaries.filter((summary) => summary.id && summary.sourceId).map((summary) => [summary.sourceId, summary.id])
+      );
+      enriched = await enrichTenders(enrichable, { crawlLogIds });
     }
   }
 
@@ -252,8 +321,6 @@ async function crawlOneSource(portalId, portal, source) {
   try {
     const rateLimit = portal.meta?.rateLimit || { maxRequests: 15, windowMs: 60000 };
     const limiter = registry.for(portalId, rateLimit.maxRequests, rateLimit.windowMs);
-
-    await limiter.acquire();
     const tenders = await withRetry(() =>
       portal.discover({
         maxResults: config.maxResultsPerPortal,
@@ -266,12 +333,21 @@ async function crawlOneSource(portalId, portal, source) {
       try {
         // Respektvolle Verzögerung zwischen den Requests
         await sleep(config.requestDelayMs);
-        const result = saveTender(tender, now);
+        const result = await withRetry(
+          () => saveTender(tender, now),
+          { retries: 2, baseDelayMs: 1000 }
+        );
         if (result.isNew) {
           summary.itemsNew += 1;
           summary.tenderIds.push(result.tenderId);
         } else if (result.changed) {
           summary.itemsChanged += 1;
+          summary.tenderIds.push(result.tenderId);
+        }
+        // NRW liefert Listendaten und Detaildaten getrennt. Auch ein bereits
+        // bekannter Treffer muss bei fehlender Detailanreicherung erneut in
+        // die Enrich-Phase gelangen.
+        if (portalId === 'nrw' && !summary.tenderIds.includes(result.tenderId)) {
           summary.tenderIds.push(result.tenderId);
         }
       } catch (error) {

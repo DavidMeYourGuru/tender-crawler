@@ -7,6 +7,7 @@ import {
   deriveStatus,
   parseMoneyToCents,
   mapLimit,
+  normalizeCpv,
 } from '../src/utils.js';
 
 test('contentHash erzeugt stabilen Hash', () => {
@@ -35,6 +36,27 @@ test('normalizeDate erkennt deutsches Format', () => {
 test('normalizeDate erkennt Monatsnamen', () => {
   assert.equal(normalizeDate('15. August 2026'), '2026-08-15');
   assert.equal(normalizeDate('3. März 2026, 12:00'), '2026-03-03');
+});
+
+test('normalizeCpv normalisiert Codes und Labels aus verschiedenen Formen', () => {
+  // String-Array mit Suffix
+  assert.deepEqual(
+    normalizeCpv(['45000000-7', '45331000-6'], ['Bau', 'Heizung']),
+    { cpvCodes: ['45000000', '45331000'], cpvLabels: ['Bau', 'Heizung'] }
+  );
+  // Objekt-Array (code/label)
+  assert.deepEqual(
+    normalizeCpv([{ code: '45000000-7', label: 'Bauarbeiten' }]),
+    { cpvCodes: ['45000000'], cpvLabels: ['Bauarbeiten'] }
+  );
+  // Leere Eingabe → null
+  assert.deepEqual(normalizeCpv(null, null), { cpvCodes: null, cpvLabels: null });
+  assert.deepEqual(normalizeCpv([], []), { cpvCodes: null, cpvLabels: null });
+  // Deduplizierung
+  assert.deepEqual(
+    normalizeCpv(['45000000-7', '45000000-7'], ['Bau', 'Bau']),
+    { cpvCodes: ['45000000'], cpvLabels: ['Bau'] }
+  );
 });
 
 test('normalizeDate gibt null bei ungültigen Werten zurück', () => {

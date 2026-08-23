@@ -194,3 +194,45 @@ export function hostname(url) {
     return url;
   }
 }
+
+/**
+ * Normalisiert CPV-Codes/Labels aus den unterschiedlichen Quellenformaten
+ * (String, String-Array, Objekt-Array mit code/label) in einheitliche
+ * { cpvCodes, cpvLabels }-Felder. Codes werden auf 8 Ziffern reduziert.
+ * Liefert null für beide, wenn nichts gefunden wurde.
+ */
+export function normalizeCpv(codes, labels) {
+  const toArr = (v) => {
+    if (v == null) return [];
+    if (Array.isArray(v)) return v;
+    if (typeof v === 'string') return v ? [v] : [];
+    return [v];
+  };
+
+  const cpvCodes = [];
+  const cpvLabels = [];
+
+  for (const c of toArr(codes)) {
+    if (typeof c === 'string') {
+      const code = c.replace(/[^0-9]/g, '').slice(0, 8);
+      if (code) cpvCodes.push(code);
+    } else if (c && typeof c === 'object') {
+      const code = c.code || c.cpvCode || c.cpv || c.id;
+      if (code != null) {
+        const norm = String(code).replace(/[^0-9]/g, '').slice(0, 8);
+        if (norm) cpvCodes.push(norm);
+      }
+      const label = c.label || c.cpvLabel || c.name || c.text;
+      if (label != null && String(label).trim()) cpvLabels.push(String(label).trim());
+    }
+  }
+
+  for (const l of toArr(labels)) {
+    if (typeof l === 'string' && l.trim()) cpvLabels.push(l.trim());
+  }
+
+  return {
+    cpvCodes: cpvCodes.length ? [...new Set(cpvCodes)] : null,
+    cpvLabels: cpvLabels.length ? [...new Set(cpvLabels)] : null,
+  };
+}

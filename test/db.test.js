@@ -11,8 +11,11 @@ process.env.AUTH_ENABLED = 'false';
 process.env.CRAWL_ON_START = 'false';
 
 const {
+  db,
   saveTender,
   getTenderById,
+  getTenderByExternalId,
+  getTenderBundleById,
   getTenderChanges,
   getSources,
   getStats,
@@ -49,6 +52,7 @@ before(() => {
 });
 
 after(() => {
+  db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -148,4 +152,66 @@ test('listTenders parst JSON-Spalten', () => {
   const tender = result.tenders[0];
   assert.ok(Array.isArray(tender.cpv_codes));
   assert.ok(Array.isArray(tender.cpv_labels));
+});
+
+test('Detail-Bundle wird versioniert und durch dünnen Listentreffer nicht verkürzt', () => {
+  const bundleTender = makeTender({
+    sourceId: 'nrw', externalId: 'bundle-001', portalProjectId: 'bundle-001',
+    description: 'Vollständige Langbeschreibung', cpvCodes: ['71220000-6'],
+    detailStatus: 'complete',
+    detailCompleteness: { overall: 'complete', sections: { overview: 'complete', documents: 'complete' } },
+    detailBundle: {
+      completeness: { overall: 'complete', sections: { overview: 'complete', documents: 'complete' } },
+      documents: [{ filename: 'Vergabeunterlagen.pdf', category: 'documents', locator: { href: 'https://example.test/doc.pdf' } }],
+      snapshots: [{ kind: 'overview', sourceUrl: 'https://example.test/tender', content: '<main>v1</main>' }],
+    },
+  });
+  const first = saveTender(bundleTender);
+  saveTender(bundleTender);
+  const thin = saveTender({
+    sourceId: 'nrw', externalId: 'bundle-001', portalProjectId: 'bundle-001',
+    title: bundleTender.title, url: bundleTender.url, status: 'open',
+    submissionDeadline: bundleTender.submissionDeadline, contentHash: bundleTender.contentHash,
+  });
+  const stored = getTenderById(first.tenderId);
+  const detail = getTenderBundleById(first.tenderId);
+  assert.equal(thin.tenderId, first.tenderId);
+  assert.equal(stored.description, 'Vollständige Langbeschreibung');
+  assert.equal(detail.documents.length, 1);
+  assert.equal(detail.snapshots.length, 1);
+});
+
+test('Detail-Bundle wird atomar gespeichert und fehlerhafte Bundles hinterlassen keinen Kerndatensatz', () => {
+  const circular = {};
+  circular.self = circular;
+  assert.throws(() => saveTender(makeTender({
+    sourceId: 'nrw', externalId: 'atomic-failure', portalProjectId: 'atomic-failure',
+    detailBundle: { metadata: circular, completeness: { overall: 'complete' } },
+  })));
+  assert.equal(getTenderByExternalId('nrw', 'atomic-failure'), undefined);
+});
+
+test('Dokumente durchlaufen bei erfolgreichen Vollcrawls not_seen und removed', () => {
+  const tender = makeTender({
+    sourceId: 'nrw', externalId: 'visibility-001', portalProjectId: 'visibility-001',
+    detailStatus: 'complete', detailCrawlKind: 'full', fullCrawlSucceeded: true,
+    detailCompleteness: { overall: 'complete', sections: { documents: 'complete' } },
+    detailBundle: {
+      fullCrawlSucceeded: true,
+      completeness: { overall: 'complete', sections: { documents: 'complete' } },
+      documents: [{ filename: 'initial.pdf', category: 'documents', locator: { href: 'https://example.test/initial.pdf' } }],
+    },
+  });
+  const first = saveTender(tender);
+  const emptyBundle = {
+    sourceId: tender.sourceId, externalId: tender.externalId, portalProjectId: tender.portalProjectId,
+    title: tender.title, url: tender.url, status: 'open', contentHash: tender.contentHash,
+    detailStatus: 'complete', detailCrawlKind: 'full', fullCrawlSucceeded: true,
+    detailCompleteness: { overall: 'complete', sections: { documents: 'complete' } },
+    detailBundle: { fullCrawlSucceeded: true, completeness: { overall: 'complete', sections: { documents: 'complete' } }, documents: [] },
+  };
+  saveTender(emptyBundle);
+  assert.equal(getTenderBundleById(first.tenderId).documents[0].visibility_status, 'not_seen');
+  saveTender(emptyBundle);
+  assert.equal(getTenderBundleById(first.tenderId).documents[0].visibility_status, 'removed');
 });

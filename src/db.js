@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import config from './config.js';
 
@@ -74,7 +74,10 @@ CREATE TABLE IF NOT EXISTS tender_changes (
   changed_at TEXT NOT NULL,
   field TEXT NOT NULL,
   old_value TEXT,
-  new_value TEXT
+  new_value TEXT,
+  entity_type TEXT NOT NULL DEFAULT 'tender',
+  entity_key TEXT,
+  change_kind TEXT NOT NULL DEFAULT 'updated'
 );
 
 CREATE INDEX IF NOT EXISTS idx_tender_changes_tender ON tender_changes(tender_id);
@@ -90,7 +93,15 @@ CREATE TABLE IF NOT EXISTS crawl_log (
   items_new INTEGER NOT NULL DEFAULT 0,
   items_changed INTEGER NOT NULL DEFAULT 0,
   errors INTEGER NOT NULL DEFAULT 0,
-  error_detail TEXT
+  error_detail TEXT,
+  detail_pages_success INTEGER NOT NULL DEFAULT 0,
+  detail_pages_failed INTEGER NOT NULL DEFAULT 0,
+  tenders_complete INTEGER NOT NULL DEFAULT 0,
+  tenders_partial INTEGER NOT NULL DEFAULT 0,
+  documents_inventoried INTEGER NOT NULL DEFAULT 0,
+  messages_inventoried INTEGER NOT NULL DEFAULT 0,
+  login_required INTEGER NOT NULL DEFAULT 0,
+  unknown_portal_structure INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_crawl_log_started ON crawl_log(started_at DESC);
@@ -156,6 +167,139 @@ CREATE TABLE IF NOT EXISTS crawl_checkpoints (
   last_success_at TEXT,
   known_page_streak INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
+);
+
+-- Zusätzliche öffentliche Verfahrensdaten. Die Tabellen sind für die
+-- Metadateninventarisierung gedacht; Binärdateien werden in dieser Phase
+-- ausdrücklich noch nicht gespeichert.
+CREATE TABLE IF NOT EXISTS tender_lots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  lot_key TEXT NOT NULL,
+  lot_number TEXT,
+  title TEXT,
+  description TEXT,
+  cpv_codes TEXT,
+  cpv_labels TEXT,
+  estimated_value_cents INTEGER,
+  estimated_value_currency TEXT DEFAULT 'EUR',
+  place_of_performance TEXT,
+  contract_duration TEXT,
+  metadata_json TEXT,
+  content_hash TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(tender_id, lot_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_lots_tender ON tender_lots(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_criteria (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  lot_id INTEGER REFERENCES tender_lots(id) ON DELETE CASCADE,
+  criterion_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  code TEXT,
+  title TEXT,
+  description TEXT,
+  weight REAL,
+  minimum_value TEXT,
+  required INTEGER,
+  source_section TEXT,
+  metadata_json TEXT,
+  content_hash TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(tender_id, criterion_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_criteria_tender ON tender_criteria(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  portal_file_id TEXT,
+  category TEXT,
+  filename TEXT NOT NULL,
+  mime_type TEXT,
+  extension TEXT,
+  size_bytes INTEGER,
+  published_at TEXT,
+  source_url TEXT,
+  locator_json TEXT,
+  access_status TEXT NOT NULL DEFAULT 'public',
+  download_status TEXT NOT NULL DEFAULT 'not_requested',
+  local_path TEXT,
+  binary_hash TEXT,
+  document_text TEXT,
+  version_key TEXT,
+  version_label TEXT,
+  supersedes_document_id INTEGER REFERENCES tender_documents(id),
+  visibility_status TEXT NOT NULL DEFAULT 'active',
+  not_seen_count INTEGER NOT NULL DEFAULT 0,
+  last_full_seen_at TEXT,
+  last_seen_crawl_token TEXT,
+  content_hash TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(tender_id, portal_file_id, filename)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_documents_tender ON tender_documents(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  portal_message_id TEXT,
+  subject TEXT,
+  body TEXT,
+  published_at TEXT,
+  source_url TEXT,
+  attachments_json TEXT,
+  content_hash TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(tender_id, portal_message_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_messages_tender ON tender_messages(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  source_url TEXT,
+  mime_type TEXT,
+  content TEXT,
+  content_hash TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  fetched_at TEXT NOT NULL,
+  UNIQUE(tender_id, kind, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_snapshots_tender ON tender_snapshots(tender_id, kind, version);
+
+CREATE TABLE IF NOT EXISTS tender_discovery_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  portal_project_id TEXT NOT NULL,
+  title TEXT,
+  contracting_authority TEXT,
+  publication_date TEXT,
+  submission_deadline TEXT,
+  cpv_codes TEXT,
+  cpv_labels TEXT,
+  in_scope INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(source_id, portal_project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_discovery_cache_source ON tender_discovery_cache(source_id, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS tender_migration_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id TEXT NOT NULL,
+  portal_project_id TEXT NOT NULL,
+  title TEXT,
+  candidate_count INTEGER NOT NULL,
+  candidate_ids TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `);
 
@@ -466,6 +610,39 @@ function ensureColumn(table, column, definition) {
 }
 ensureColumn('tenders', 'search_text_full', 'TEXT');
 ensureColumn('funding_programs', 'search_text_full', 'TEXT');
+ensureColumn('tenders', 'portal_project_id', 'TEXT');
+ensureColumn('tenders', 'reference_number', 'TEXT');
+ensureColumn('tenders', 'procedure_type', 'TEXT');
+ensureColumn('tenders', 'question_deadline', 'TEXT');
+ensureColumn('tenders', 'detail_status', 'TEXT');
+ensureColumn('tenders', 'detail_crawled_at', 'TEXT');
+ensureColumn('tenders', 'detail_completeness', 'TEXT');
+ensureColumn('tenders', 'portal_metadata_json', 'TEXT');
+ensureColumn('tenders', 'detail_crawl_kind', "TEXT NOT NULL DEFAULT 'unknown'");
+ensureColumn('tenders', 'last_full_seen_at', 'TEXT');
+ensureColumn('tender_changes', 'entity_type', "TEXT NOT NULL DEFAULT 'tender'");
+ensureColumn('tender_changes', 'entity_key', 'TEXT');
+ensureColumn('tender_changes', 'change_kind', "TEXT NOT NULL DEFAULT 'updated'");
+ensureColumn('tender_documents', 'version_key', 'TEXT');
+ensureColumn('tender_documents', 'version_label', 'TEXT');
+ensureColumn('tender_documents', 'supersedes_document_id', 'INTEGER');
+ensureColumn('tender_documents', 'visibility_status', "TEXT NOT NULL DEFAULT 'active'");
+ensureColumn('tender_documents', 'not_seen_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('tender_documents', 'last_full_seen_at', 'TEXT');
+ensureColumn('tender_documents', 'last_seen_crawl_token', 'TEXT');
+ensureColumn('tender_discovery_cache', 'discovery_fingerprint', 'TEXT');
+ensureColumn('tender_discovery_cache', 'last_detail_at', 'TEXT');
+ensureColumn('tender_discovery_cache', 'detail_status', 'TEXT');
+ensureColumn('crawl_log', 'detail_pages_success', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'detail_pages_failed', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'tenders_complete', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'tenders_partial', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'documents_inventoried', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'messages_inventoried', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'login_required', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('crawl_log', 'unknown_portal_structure', 'INTEGER NOT NULL DEFAULT 0');
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tenders_source_portal_project
+  ON tenders(source_id, portal_project_id) WHERE portal_project_id IS NOT NULL`);
 
 // document_chunks: alte (unbenutzte) Version ohne UNIQUE(chunk_key) sicher ersetzen
 try {
@@ -654,6 +831,9 @@ export const stmts = {
   getTenderBySourceAndExternalId: db.prepare(
     `SELECT * FROM tenders WHERE source_id = ? AND external_id = ?`
   ),
+  getTenderBySourceAndPortalProject: db.prepare(
+    `SELECT * FROM tenders WHERE source_id = ? AND portal_project_id = ?`
+  ),
   getTenderById: db.prepare(`SELECT * FROM tenders WHERE id = ?`),
   selectNewTenderIds: db.prepare(`
     SELECT id FROM tenders
@@ -673,7 +853,23 @@ export const stmts = {
   finishCrawlLog: db.prepare(`
     UPDATE crawl_log SET finished_at = @finished_at, status = @status,
       items_discovered = @items_discovered, items_new = @items_new,
-      items_changed = @items_changed, errors = @errors, error_detail = @error_detail
+      items_changed = @items_changed, errors = @errors, error_detail = @error_detail,
+      detail_pages_success = @detail_pages_success, detail_pages_failed = @detail_pages_failed,
+      tenders_complete = @tenders_complete, tenders_partial = @tenders_partial,
+      documents_inventoried = @documents_inventoried, messages_inventoried = @messages_inventoried,
+      login_required = @login_required, unknown_portal_structure = @unknown_portal_structure
+    WHERE id = @id
+  `),
+  updateCrawlDetailMetrics: db.prepare(`
+    UPDATE crawl_log SET
+      detail_pages_success = @detail_pages_success,
+      detail_pages_failed = @detail_pages_failed,
+      tenders_complete = @tenders_complete,
+      tenders_partial = @tenders_partial,
+      documents_inventoried = @documents_inventoried,
+      messages_inventoried = @messages_inventoried,
+      login_required = @login_required,
+      unknown_portal_structure = @unknown_portal_structure
     WHERE id = @id
   `),
   insertTender: db.prepare(`
@@ -682,17 +878,24 @@ export const stmts = {
       cpv_codes, cpv_labels, estimated_value_cents, estimated_value_currency,
       place_of_performance, award_criteria, tender_type, publication_date,
       submission_deadline, opening_date, contract_duration, document_url,
-      status, content_hash, search_text_full, first_seen_at, last_seen_at, last_changed_at
+      status, content_hash, search_text_full, portal_project_id, reference_number,
+      procedure_type, question_deadline, detail_status, detail_crawled_at,
+      detail_completeness, portal_metadata_json, detail_crawl_kind, last_full_seen_at,
+      first_seen_at, last_seen_at, last_changed_at
     ) VALUES (
       @source_id, @external_id, @title, @url, @description, @contracting_authority,
       @cpv_codes, @cpv_labels, @estimated_value_cents, @estimated_value_currency,
       @place_of_performance, @award_criteria, @tender_type, @publication_date,
       @submission_deadline, @opening_date, @contract_duration, @document_url,
-      @status, @content_hash, @search_text_full, @now, @now, @now
+      @status, @content_hash, @search_text_full, @portal_project_id, @reference_number,
+      @procedure_type, @question_deadline, @detail_status, @detail_crawled_at,
+      @detail_completeness, @portal_metadata_json, @detail_crawl_kind, @last_full_seen_at,
+      @now, @now, @now
     )
   `),
   updateTender: db.prepare(`
     UPDATE tenders SET
+      external_id = @external_id,
       title = @title,
       url = @url,
       description = COALESCE(@description, description),
@@ -712,6 +915,16 @@ export const stmts = {
       status = @status,
       content_hash = @content_hash,
       search_text_full = COALESCE(@search_text_full, search_text_full),
+      portal_project_id = COALESCE(@portal_project_id, portal_project_id),
+      reference_number = COALESCE(@reference_number, reference_number),
+      procedure_type = COALESCE(@procedure_type, procedure_type),
+      question_deadline = COALESCE(@question_deadline, question_deadline),
+      detail_status = COALESCE(@detail_status, detail_status),
+      detail_crawled_at = COALESCE(@detail_crawled_at, detail_crawled_at),
+      detail_completeness = COALESCE(@detail_completeness, detail_completeness),
+      portal_metadata_json = COALESCE(@portal_metadata_json, portal_metadata_json),
+      detail_crawl_kind = COALESCE(@detail_crawl_kind, detail_crawl_kind),
+      last_full_seen_at = COALESCE(@last_full_seen_at, last_full_seen_at),
       last_seen_at = @now,
       last_changed_at = CASE WHEN @changed = 1 THEN @now ELSE last_changed_at END
     WHERE id = @id
@@ -719,6 +932,12 @@ export const stmts = {
   insertChange: db.prepare(`
     INSERT INTO tender_changes (tender_id, changed_at, field, old_value, new_value)
     VALUES (?, ?, ?, ?, ?)
+  `),
+  insertEntityChange: db.prepare(`
+    INSERT INTO tender_changes (
+      tender_id, changed_at, field, old_value, new_value,
+      entity_type, entity_key, change_kind
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `),
   updateLlamaAnalysis: db.prepare(`
     UPDATE tenders SET
@@ -1068,6 +1287,8 @@ export function listTenders({
     cpv_codes: row.cpv_codes ? JSON.parse(row.cpv_codes) : null,
     cpv_labels: row.cpv_labels ? JSON.parse(row.cpv_labels) : null,
     llm_requirements: row.llm_requirements ? JSON.parse(row.llm_requirements) : null,
+    portal_metadata: row.portal_metadata_json ? safeParseJson(row.portal_metadata_json) : null,
+    detail_completeness: row.detail_completeness ? safeParseJson(row.detail_completeness) || row.detail_completeness : null,
   }));
 
   return {
@@ -1095,6 +1316,28 @@ export function finishCrawlLog(summary) {
     items_changed: summary.itemsChanged,
     errors: summary.errors,
     error_detail: summary.errorMessage || null,
+    detail_pages_success: summary.detailPagesSuccess || 0,
+    detail_pages_failed: summary.detailPagesFailed || 0,
+    tenders_complete: summary.tendersComplete || 0,
+    tenders_partial: summary.tendersPartial || 0,
+    documents_inventoried: summary.documentsInventoried || 0,
+    messages_inventoried: summary.messagesInventoried || 0,
+    login_required: summary.loginRequired || 0,
+    unknown_portal_structure: summary.unknownPortalStructure || 0,
+  });
+}
+
+export function updateCrawlDetailMetrics(metrics) {
+  stmts.updateCrawlDetailMetrics.run({
+    id: metrics.id,
+    detail_pages_success: metrics.detailPagesSuccess || 0,
+    detail_pages_failed: metrics.detailPagesFailed || 0,
+    tenders_complete: metrics.tendersComplete || 0,
+    tenders_partial: metrics.tendersPartial || 0,
+    documents_inventoried: metrics.documentsInventoried || 0,
+    messages_inventoried: metrics.messagesInventoried || 0,
+    login_required: metrics.loginRequired || 0,
+    unknown_portal_structure: metrics.unknownPortalStructure || 0,
   });
 }
 
@@ -1103,118 +1346,215 @@ export function updateSourceCrawlTime(sourceId, now = new Date().toISOString()) 
 }
 
 /**
- * Speichert einen Tender und erkennt Änderungen.
- * Gibt { isNew, changed, tenderId, changes[] } zurück.
+ * Speichert einen Tender und erkennt Änderungen. Detailtreffer werden mit dem
+ * vorhandenen Datensatz zusammengeführt: ein späterer, dünner Listentreffer
+ * kann weder Beschreibung noch Suchtext oder Detaildaten zurücksetzen.
  */
-const saveTenderTx = db.transaction(({ tender, now }) => {
-  const existing = stmts.getTenderBySourceAndExternalId.get(tender.sourceId, tender.externalId);
+function jsonOrNull(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
 
-  const fields = {
+function normalizedArray(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value;
+  return [value];
+}
+
+function tenderContentHash(fields) {
+  const payload = {
+    title: fields.title,
+    url: fields.url,
+    description: fields.description,
+    authority: fields.contracting_authority,
+    cpvCodes: fields.cpv_codes,
+    cpvLabels: fields.cpv_labels,
+    value: fields.estimated_value_cents,
+    currency: fields.estimated_value_currency,
+    place: fields.place_of_performance,
+    award: fields.award_criteria,
+    type: fields.tender_type,
+    publication: fields.publication_date,
+    deadline: fields.submission_deadline,
+    opening: fields.opening_date,
+    duration: fields.contract_duration,
+    document: fields.document_url,
+    portalProjectId: fields.portal_project_id,
+    referenceNumber: fields.reference_number,
+    procedureType: fields.procedure_type,
+    questionDeadline: fields.question_deadline,
+    metadata: fields.portal_metadata_json,
+  };
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function effectiveValue(incoming, previous, fallback = null) {
+  return incoming != null && incoming !== '' ? incoming : (previous != null ? previous : fallback);
+}
+
+const saveTenderTx = db.transaction(({ tender, now }) => {
+  let existing = tender.portalProjectId
+    ? stmts.getTenderBySourceAndPortalProject.get(tender.sourceId, tender.portalProjectId)
+      || (tender.externalId != null ? stmts.getTenderBySourceAndExternalId.get(tender.sourceId, tender.externalId) : null)
+    : stmts.getTenderBySourceAndExternalId.get(tender.sourceId, tender.externalId);
+  // Einmalige Migration alter Hash-IDs (vor allem Niedersachsen): nur ein
+  // eindeutig passender Titel/Auftraggeber/Publikation wird übernommen.
+  if (!existing && tender.portalProjectId && tender.title && tender.publicationDate) {
+    const candidates = db.prepare(`
+      SELECT * FROM tenders
+      WHERE source_id = ?
+        AND portal_project_id IS NULL
+        AND lower(trim(title)) = lower(trim(?))
+        AND lower(trim(coalesce(contracting_authority, ''))) = lower(trim(coalesce(?, '')))
+        AND substr(coalesce(publication_date, ''), 1, 10) = substr(?, 1, 10)
+        AND external_id <> ?
+    `).all(tender.sourceId, tender.title, tender.contractingAuthority || '', tender.publicationDate, tender.portalProjectId);
+    if (candidates.length === 1) {
+      existing = candidates[0];
+      db.prepare(`
+        INSERT INTO tender_migration_log
+          (source_id, portal_project_id, title, candidate_count, candidate_ids, status, created_at)
+        VALUES (?, ?, ?, 1, ?, 'migrated', ?)
+      `).run(tender.sourceId, tender.portalProjectId, tender.title, JSON.stringify([existing.id]), now);
+    }
+    else if (candidates.length > 1) {
+      console.warn(`[db] Mehrdeutige UUID-Migration für ${tender.sourceId}/${tender.portalProjectId}: ${candidates.length} Kandidaten`);
+      db.prepare(`
+        INSERT INTO tender_migration_log
+          (source_id, portal_project_id, title, candidate_count, candidate_ids, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'ambiguous', ?)
+      `).run(tender.sourceId, tender.portalProjectId, tender.title, candidates.length,
+        JSON.stringify(candidates.map((candidate) => candidate.id)), now);
+    }
+  }
+  const detailBundle = tender.detailBundle || tender.bundle || null;
+  const metadata = tender.portalMetadata ?? detailBundle?.metadata ?? null;
+  const fullCrawlSucceeded = tender.fullCrawlSucceeded ?? detailBundle?.fullCrawlSucceeded ?? false;
+
+  const completenessInput = tender.detailCompleteness ?? detailBundle?.completeness ?? null;
+  const effective = {
     source_id: tender.sourceId,
-    external_id: tender.externalId,
-    title: tender.title,
-    url: tender.url,
-    description: tender.description ?? null,
-    contracting_authority: tender.contractingAuthority ?? null,
-    cpv_codes: tender.cpvCodes ? JSON.stringify(tender.cpvCodes) : null,
-    cpv_labels: tender.cpvLabels ? JSON.stringify(tender.cpvLabels) : null,
-    estimated_value_cents: tender.estimatedValueCents ?? null,
-    estimated_value_currency: tender.estimatedValueCurrency || 'EUR',
-    place_of_performance: tender.placeOfPerformance ?? null,
-    award_criteria: tender.awardCriteria ?? null,
-    tender_type: tender.tenderType ?? null,
-    publication_date: tender.publicationDate ?? null,
-    submission_deadline: tender.submissionDeadline ?? null,
-    opening_date: tender.openingDate ?? null,
-    contract_duration: tender.contractDuration ?? null,
-    document_url: tender.documentUrl ?? null,
-    status: tender.status || 'open',
-    content_hash: tender.contentHash,
-    search_text_full: buildTenderSearchText({
-      ...tender,
-      llmSummary: tender.llmSummary ?? existing?.llm_summary ?? null,
-      llmRequirements: tender.llmRequirements
-        ?? (existing?.llm_requirements ? safeParseJson(existing.llm_requirements) : null),
-    }),
+    external_id: effectiveValue(tender.externalId, existing?.external_id, tender.portalProjectId || null),
+    title: effectiveValue(tender.title, existing?.title, 'Unbenannte Ausschreibung'),
+    url: effectiveValue(tender.url, existing?.url, ''),
+    description: effectiveValue(tender.description, existing?.description),
+    contracting_authority: effectiveValue(tender.contractingAuthority, existing?.contracting_authority),
+    cpv_codes: jsonOrNull(
+      tender.cpvCodes != null && (normalizedArray(tender.cpvCodes)?.length || !existing)
+        ? normalizedArray(tender.cpvCodes)
+        : safeParseJson(existing?.cpv_codes)
+    ),
+    cpv_labels: jsonOrNull(
+      tender.cpvLabels != null && (normalizedArray(tender.cpvLabels)?.length || !existing)
+        ? normalizedArray(tender.cpvLabels)
+        : safeParseJson(existing?.cpv_labels)
+    ),
+    estimated_value_cents: effectiveValue(tender.estimatedValueCents, existing?.estimated_value_cents),
+    estimated_value_currency: effectiveValue(tender.estimatedValueCurrency, existing?.estimated_value_currency, 'EUR'),
+    place_of_performance: effectiveValue(tender.placeOfPerformance, existing?.place_of_performance),
+    award_criteria: effectiveValue(tender.awardCriteria, existing?.award_criteria),
+    tender_type: effectiveValue(tender.tenderType, existing?.tender_type),
+    publication_date: effectiveValue(tender.publicationDate, existing?.publication_date),
+    submission_deadline: effectiveValue(tender.submissionDeadline, existing?.submission_deadline),
+    opening_date: effectiveValue(tender.openingDate, existing?.opening_date),
+    contract_duration: effectiveValue(tender.contractDuration, existing?.contract_duration),
+    document_url: effectiveValue(tender.documentUrl, existing?.document_url),
+    status: effectiveValue(tender.status, existing?.status, 'open'),
+    portal_project_id: effectiveValue(tender.portalProjectId, existing?.portal_project_id),
+    reference_number: effectiveValue(tender.referenceNumber, existing?.reference_number),
+    procedure_type: effectiveValue(tender.procedureType, existing?.procedure_type),
+    question_deadline: effectiveValue(tender.questionDeadline, existing?.question_deadline),
+    detail_status: effectiveValue(tender.detailStatus ?? detailBundle?.detailStatus, existing?.detail_status),
+    detail_crawled_at: tender.detailCrawledAt ?? detailBundle?.detailCrawledAt ?? existing?.detail_crawled_at ?? null,
+    detail_crawl_kind: effectiveValue(tender.detailCrawlKind ?? detailBundle?.crawlKind, existing?.detail_crawl_kind, 'unknown'),
+    last_full_seen_at: fullCrawlSucceeded ? (tender.detailCrawledAt || now) : (existing?.last_full_seen_at ?? null),
+    detail_completeness: jsonOrNull(completenessInput) ?? existing?.detail_completeness ?? null,
+    portal_metadata_json: jsonOrNull(metadata) ?? existing?.portal_metadata_json ?? null,
     now,
   };
+  effective.content_hash = tender.contentHash || tenderContentHash(effective);
+  // Nach einer Vollanreicherung können spätere Gridzeilen bewusst nur Titel
+  // und Frist enthalten. Ihr kurzlebiger List-Hash darf den Detail-Hash nicht
+  // zurücksetzen oder unnötige Änderungsereignisse erzeugen.
+  if (existing?.detail_status === 'complete' && !detailBundle
+    && tender.description == null && tender.cpvCodes == null && tender.cpvLabels == null) {
+    effective.content_hash = existing.content_hash;
+  }
+  effective.search_text_full = buildTenderSearchText({
+    ...tender,
+    title: effective.title,
+    description: effective.description,
+    contractingAuthority: effective.contracting_authority,
+    cpvCodes: safeParseJson(effective.cpv_codes),
+    cpvLabels: safeParseJson(effective.cpv_labels),
+    placeOfPerformance: effective.place_of_performance,
+    awardCriteria: effective.award_criteria,
+    llmSummary: tender.llmSummary ?? existing?.llm_summary ?? null,
+    llmRequirements: tender.llmRequirements
+      ?? (existing?.llm_requirements ? safeParseJson(existing.llm_requirements) : null),
+  });
 
   if (!existing) {
-    const result = stmts.insertTender.run(fields);
+    const result = stmts.insertTender.run({ ...effective, portal_metadata_json: effective.portal_metadata_json });
     const tenderId = Number(result.lastInsertRowid);
     saveSourceDocument({
-      docKind: 'tender', entityId: tenderId, canonicalUrl: fields.url,
-      documentTitle: fields.title, content: fields.search_text_full,
+      docKind: 'tender', entityId: tenderId, canonicalUrl: effective.url,
+      documentTitle: effective.title, content: effective.search_text_full,
     });
-    return { isNew: true, changed: true, tenderId, changes: [{ field: 'created', oldValue: null, newValue: fields.title }] };
+    if (detailBundle) persistTenderDetailBundleRaw(tenderId, detailBundle, now);
+    return { isNew: true, changed: true, tenderId, changes: [{ field: 'created', oldValue: null, newValue: effective.title }] };
   }
 
-  // Änderungen erkennen (Achtung: existing nutzt snake_case aus der DB,
-  // tender nutzt camelCase aus dem Portal-Format)
   const comparisons = [
-    ['title', existing.title, tender.title],
-    ['status', existing.status, tender.status],
-    ['submission_deadline', existing.submission_deadline, tender.submissionDeadline],
-    ['estimated_value_cents', existing.estimated_value_cents, tender.estimatedValueCents],
-    ['contracting_authority', existing.contracting_authority, tender.contractingAuthority],
-    ['description', existing.description, tender.description],
-    ['cpv_codes', existing.cpv_codes, fields.cpv_codes],
-    ['place_of_performance', existing.place_of_performance, tender.placeOfPerformance],
-    ['document_url', existing.document_url, tender.documentUrl],
+    ['external_id', existing.external_id, effective.external_id],
+    ['title', existing.title, effective.title],
+    ['status', existing.status, effective.status],
+    ['submission_deadline', existing.submission_deadline, effective.submission_deadline],
+    ['estimated_value_cents', existing.estimated_value_cents, effective.estimated_value_cents],
+    ['contracting_authority', existing.contracting_authority, effective.contracting_authority],
+    ['description', existing.description, effective.description],
+    ['cpv_codes', existing.cpv_codes, effective.cpv_codes],
+    ['cpv_labels', existing.cpv_labels, effective.cpv_labels],
+    ['estimated_value_currency', existing.estimated_value_currency, effective.estimated_value_currency],
+    ['place_of_performance', existing.place_of_performance, effective.place_of_performance],
+    ['award_criteria', existing.award_criteria, effective.award_criteria],
+    ['tender_type', existing.tender_type, effective.tender_type],
+    ['publication_date', existing.publication_date, effective.publication_date],
+    ['document_url', existing.document_url, effective.document_url],
+    ['opening_date', existing.opening_date, effective.opening_date],
+    ['contract_duration', existing.contract_duration, effective.contract_duration],
+    ['portal_project_id', existing.portal_project_id, effective.portal_project_id],
+    ['reference_number', existing.reference_number, effective.reference_number],
+    ['procedure_type', existing.procedure_type, effective.procedure_type],
+    ['question_deadline', existing.question_deadline, effective.question_deadline],
+    ['detail_status', existing.detail_status, effective.detail_status],
+    ['detail_completeness', existing.detail_completeness, effective.detail_completeness],
+    ['detail_crawl_kind', existing.detail_crawl_kind, effective.detail_crawl_kind],
+    ['portal_metadata_json', existing.portal_metadata_json, effective.portal_metadata_json],
   ];
-
-  // Felder, die in updateTender mit COALESCE gesetzt werden:
-  // Ein NULL-Wert überschreibt einen vorhandenen Wert NICHT.
-  const coalescedFields = new Set([
-    'description',
-    'contracting_authority',
-    'cpv_codes',
-    'cpv_labels',
-    'estimated_value_cents',
-    'estimated_value_currency',
-    'place_of_performance',
-    'award_criteria',
-    'tender_type',
-    'publication_date',
-    'submission_deadline',
-    'opening_date',
-    'contract_duration',
-    'document_url',
-  ]);
-
   const changes = [];
   for (const [field, oldValue, newValue] of comparisons) {
-    // Effektiver Wert: Bei COALESCE-Feldern bleibt ein vorhandener Wert
-    // erhalten, wenn der neue Wert null ist – dann liegt keine Änderung vor.
-    const effectiveNew = coalescedFields.has(field) && newValue == null ? oldValue : newValue;
-    if (String(oldValue ?? '') !== String(effectiveNew ?? '')) {
-      changes.push({ field, oldValue, newValue });
-    }
+    if (String(oldValue ?? '') !== String(newValue ?? '')) changes.push({ field, oldValue, newValue });
   }
-  const changed = changes.length > 0 || existing.content_hash !== tender.contentHash;
-  if (changed && existing.content_hash !== tender.contentHash) {
-    if (!changes.some((c) => c.field === 'content')) {
-      changes.push({ field: 'content', oldValue: existing.content_hash, newValue: tender.contentHash });
-    }
+  const changed = changes.length > 0 || existing.content_hash !== effective.content_hash;
+  if (existing.content_hash !== effective.content_hash && !changes.some((c) => c.field === 'content')) {
+    changes.push({ field: 'content', oldValue: existing.content_hash, newValue: effective.content_hash });
   }
-
   for (const change of changes) {
-    stmts.insertChange.run(
-      existing.id,
-      now,
-      change.field,
+    stmts.insertEntityChange.run(existing.id, now, change.field,
       change.oldValue == null ? null : String(change.oldValue),
-      change.newValue == null ? null : String(change.newValue)
-    );
+      change.newValue == null ? null : String(change.newValue),
+      'tender', change.field, change.field === 'content' ? 'content_changed' : 'updated');
   }
-
-  stmts.updateTender.run({ ...fields, id: existing.id, changed: changed ? 1 : 0 });
+  stmts.updateTender.run({ ...effective, id: existing.id, changed: changed ? 1 : 0 });
   if (changed) {
     saveSourceDocument({
-      docKind: 'tender', entityId: existing.id, canonicalUrl: fields.url,
-      documentTitle: fields.title, content: fields.search_text_full,
+      docKind: 'tender', entityId: existing.id, canonicalUrl: effective.url,
+      documentTitle: effective.title, content: effective.search_text_full,
     });
   }
+  if (detailBundle) persistTenderDetailBundleRaw(existing.id, detailBundle, now);
   return { isNew: false, changed, tenderId: existing.id, changes };
 });
 
@@ -1224,6 +1564,409 @@ export function saveTender(tender, now = new Date().toISOString()) {
 
 export function getTenderById(id) {
   return stmts.getTenderById.get(id);
+}
+
+export function getTenderByExternalId(sourceId, externalId) {
+  return stmts.getTenderBySourceAndExternalId.get(sourceId, externalId);
+}
+
+export function getTenderByPortalProject(sourceId, portalProjectId) {
+  if (!portalProjectId) return null;
+  return stmts.getTenderBySourceAndPortalProject.get(sourceId, portalProjectId);
+}
+
+function bundleValue(object, ...keys) {
+  for (const key of keys) {
+    if (object && object[key] != null) return object[key];
+  }
+  return null;
+}
+
+function detailHash(value) {
+  if (value == null) return createHash('sha256').update('').digest('hex');
+  return createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
+}
+
+/** Persistiert Kindentitäten und rohe Seiten-Snapshots eines Detail-Bundles. */
+const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
+  if (!bundle) return { tenderId, sections: {} };
+  const lots = Array.isArray(bundle.lots) ? bundle.lots : [];
+  const criteria = Array.isArray(bundle.criteria) ? bundle.criteria : [];
+  const documents = Array.isArray(bundle.documents) ? bundle.documents : [];
+  const messages = Array.isArray(bundle.messages) ? bundle.messages : [];
+  const snapshots = Array.isArray(bundle.snapshots) ? bundle.snapshots : [];
+  // ISO-Zeitstempel haben Millisekundenauflösung. Zwei schnelle Vollcrawls
+  // dürfen trotzdem nicht denselben "gesehen"-Marker verwenden, sonst kann
+  // ein Dokument in einem Lauf doppelt als fehlend gezählt werden.
+  const fullCrawlToken = bundle.fullCrawlSucceeded === true
+    ? (bundle.crawlToken || `${now}:${randomUUID()}`)
+    : null;
+  const recordEntityChange = (entityType, entityKey, changeKind, oldValue, newValue) => {
+    if (String(oldValue ?? '') === String(newValue ?? '') && changeKind !== 'created') return;
+    stmts.insertEntityChange.run(
+      tenderId, now, `${entityType}:${entityKey}`,
+      oldValue == null ? null : String(oldValue),
+      newValue == null ? null : String(newValue),
+      entityType, String(entityKey), changeKind
+    );
+  };
+
+  const lotIdByKey = new Map();
+  const findLot = db.prepare(`SELECT * FROM tender_lots WHERE tender_id = ? AND lot_key = ?`);
+  const insertLot = db.prepare(`
+    INSERT INTO tender_lots (
+      tender_id, lot_key, lot_number, title, description, cpv_codes, cpv_labels,
+      estimated_value_cents, estimated_value_currency, place_of_performance,
+      contract_duration, metadata_json, content_hash, first_seen_at, last_seen_at
+    ) VALUES (@tender_id, @lot_key, @lot_number, @title, @description, @cpv_codes, @cpv_labels,
+      @estimated_value_cents, @estimated_value_currency, @place_of_performance,
+      @contract_duration, @metadata_json, @content_hash, @now, @now)
+  `);
+  const updateLot = db.prepare(`
+    UPDATE tender_lots SET lot_number=@lot_number, title=@title, description=@description,
+      cpv_codes=@cpv_codes, cpv_labels=@cpv_labels, estimated_value_cents=@estimated_value_cents,
+      estimated_value_currency=@estimated_value_currency, place_of_performance=@place_of_performance,
+      contract_duration=@contract_duration, metadata_json=@metadata_json, content_hash=@content_hash,
+      last_seen_at=@now WHERE id=@id
+  `);
+  for (const lot of lots) {
+    const suppliedLotKey = bundleValue(lot, 'lotKey', 'key', 'lotNumber', 'number');
+    const lotKey = String(suppliedLotKey || `hash:${detailHash({
+      title: bundleValue(lot, 'title', 'name'),
+      description: bundleValue(lot, 'description'),
+      cpvCodes: bundleValue(lot, 'cpvCodes', 'cpv_codes'),
+      placeOfPerformance: bundleValue(lot, 'placeOfPerformance', 'place_of_performance'),
+    }).slice(0, 32)}`);
+    const values = {
+      tender_id: tenderId,
+      lot_key: lotKey,
+      lot_number: bundleValue(lot, 'lotNumber', 'number'),
+      title: bundleValue(lot, 'title', 'name'),
+      description: bundleValue(lot, 'description'),
+      cpv_codes: jsonOrNull(bundleValue(lot, 'cpvCodes', 'cpv_codes')),
+      cpv_labels: jsonOrNull(bundleValue(lot, 'cpvLabels', 'cpv_labels')),
+      estimated_value_cents: bundleValue(lot, 'estimatedValueCents', 'estimated_value_cents'),
+      estimated_value_currency: bundleValue(lot, 'estimatedValueCurrency', 'estimated_value_currency') || 'EUR',
+      place_of_performance: bundleValue(lot, 'placeOfPerformance', 'place_of_performance'),
+      contract_duration: bundleValue(lot, 'contractDuration', 'contract_duration'),
+      metadata_json: jsonOrNull(bundleValue(lot, 'metadata', 'metadataJson', 'metadata_json')),
+    };
+    values.content_hash = bundleValue(lot, 'contentHash', 'content_hash') || detailHash(values);
+    const old = findLot.get(tenderId, lotKey);
+    if (old) {
+      updateLot.run({ ...values, id: old.id, now });
+      recordEntityChange('lot', lotKey, 'updated', old.content_hash, values.content_hash);
+      lotIdByKey.set(lotKey, old.id);
+    } else {
+      const result = insertLot.run({ ...values, now });
+      recordEntityChange('lot', lotKey, 'created', null, values.content_hash);
+      lotIdByKey.set(lotKey, Number(result.lastInsertRowid));
+    }
+  }
+
+  const findCriterion = db.prepare(`SELECT * FROM tender_criteria WHERE tender_id = ? AND criterion_key = ?`);
+  const insertCriterion = db.prepare(`
+    INSERT INTO tender_criteria (
+      tender_id, lot_id, criterion_key, kind, code, title, description, weight,
+      minimum_value, required, source_section, metadata_json, content_hash, first_seen_at, last_seen_at
+    ) VALUES (@tender_id, @lot_id, @criterion_key, @kind, @code, @title, @description, @weight,
+      @minimum_value, @required, @source_section, @metadata_json, @content_hash, @now, @now)
+  `);
+  const updateCriterion = db.prepare(`
+    UPDATE tender_criteria SET lot_id=@lot_id, kind=@kind, code=@code, title=@title,
+      description=@description, weight=@weight, minimum_value=@minimum_value, required=@required,
+      source_section=@source_section, metadata_json=@metadata_json, content_hash=@content_hash,
+      last_seen_at=@now WHERE id=@id
+  `);
+  for (const criterion of criteria) {
+    const lotKey = bundleValue(criterion, 'lotKey', 'lot_key');
+    const suppliedCriterionKey = bundleValue(criterion, 'criterionKey', 'key', 'code');
+    const criterionKey = String(suppliedCriterionKey || `hash:${detailHash({
+      kind: bundleValue(criterion, 'kind', 'type'),
+      title: bundleValue(criterion, 'title', 'name'),
+      description: bundleValue(criterion, 'description', 'text'),
+      weight: bundleValue(criterion, 'weight'),
+    }).slice(0, 32)}`);
+    const values = {
+      tender_id: tenderId,
+      lot_id: lotKey ? (lotIdByKey.get(String(lotKey)) || null) : null,
+      criterion_key: criterionKey,
+      kind: bundleValue(criterion, 'kind', 'type') || 'unknown',
+      code: bundleValue(criterion, 'code'),
+      title: bundleValue(criterion, 'title', 'name'),
+      description: bundleValue(criterion, 'description', 'text'),
+      weight: bundleValue(criterion, 'weight'),
+      minimum_value: bundleValue(criterion, 'minimumValue', 'minimum_value'),
+      required: bundleValue(criterion, 'required') == null ? null : (bundleValue(criterion, 'required') ? 1 : 0),
+      source_section: bundleValue(criterion, 'sourceSection', 'source_section'),
+      metadata_json: jsonOrNull(bundleValue(criterion, 'metadata', 'metadataJson', 'metadata_json')),
+    };
+    values.content_hash = bundleValue(criterion, 'contentHash', 'content_hash') || detailHash(values);
+    const old = findCriterion.get(tenderId, criterionKey);
+    if (old) {
+      updateCriterion.run({ ...values, id: old.id, now });
+      recordEntityChange('criterion', criterionKey, 'updated', old.content_hash, values.content_hash);
+    } else {
+      insertCriterion.run({ ...values, now });
+      recordEntityChange('criterion', criterionKey, 'created', null, values.content_hash);
+    }
+  }
+
+  const findDocument = db.prepare(`SELECT * FROM tender_documents WHERE tender_id = ? AND portal_file_id = ? AND filename = ?`);
+  const insertDocument = db.prepare(`
+    INSERT INTO tender_documents (
+      tender_id, portal_file_id, category, filename, mime_type, extension, size_bytes,
+      published_at, source_url, locator_json, access_status, download_status, local_path,
+      binary_hash, document_text, content_hash, first_seen_at, last_seen_at
+      , version_key, version_label, supersedes_document_id, visibility_status, not_seen_count, last_full_seen_at,
+      last_seen_crawl_token
+    ) VALUES (@tender_id, @portal_file_id, @category, @filename, @mime_type, @extension, @size_bytes,
+      @published_at, @source_url, @locator_json, @access_status, @download_status, @local_path,
+      @binary_hash, @document_text, @content_hash, @now, @now,
+      @version_key, @version_label, @supersedes_document_id, @visibility_status, @not_seen_count, @last_full_seen_at,
+      @last_seen_crawl_token)
+  `);
+  const updateDocument = db.prepare(`
+    UPDATE tender_documents SET category=@category, mime_type=@mime_type, extension=@extension,
+      size_bytes=@size_bytes, published_at=@published_at, source_url=@source_url, locator_json=@locator_json,
+      access_status=@access_status,
+      download_status=CASE WHEN @download_status = 'not_requested' THEN download_status ELSE @download_status END,
+      local_path=COALESCE(@local_path, local_path), binary_hash=COALESCE(@binary_hash, binary_hash),
+      document_text=COALESCE(@document_text, document_text), content_hash=@content_hash, last_seen_at=@now
+      , version_key=@version_key, version_label=@version_label,
+      supersedes_document_id=COALESCE(@supersedes_document_id, supersedes_document_id),
+      visibility_status=@visibility_status, not_seen_count=@not_seen_count,
+      last_full_seen_at=COALESCE(@last_full_seen_at, last_full_seen_at),
+      last_seen_crawl_token=COALESCE(@last_seen_crawl_token, last_seen_crawl_token)
+    WHERE id=@id
+  `);
+  for (const [index, document] of documents.entries()) {
+    const filename = String(bundleValue(document, 'filename', 'name', 'fileName') || `document-${index + 1}`);
+    const locator = bundleValue(document, 'locator', 'locatorJson', 'locator_json');
+    const portalFileId = String(bundleValue(document, 'portalFileId', 'portal_file_id', 'fileId')
+      || locator?.fileId || locator?.id || `${bundleValue(document, 'category') || 'document'}:${filename}`);
+    const extension = bundleValue(document, 'extension') || path.extname(filename).replace(/^\./, '').toLowerCase() || null;
+    const values = {
+      tender_id: tenderId,
+      portal_file_id: portalFileId,
+      category: bundleValue(document, 'category', 'section'),
+      filename,
+      mime_type: bundleValue(document, 'mimeType', 'mime_type', 'type'),
+      extension,
+      size_bytes: bundleValue(document, 'sizeBytes', 'size_bytes', 'size'),
+      published_at: bundleValue(document, 'publishedAt', 'published_at', 'addedAt'),
+      source_url: bundleValue(document, 'sourceUrl', 'source_url', 'pageUrl'),
+      locator_json: jsonOrNull(locator),
+      access_status: bundleValue(document, 'accessStatus', 'access_status') || 'public',
+      download_status: bundleValue(document, 'downloadStatus', 'download_status') || 'not_requested',
+      local_path: bundleValue(document, 'localPath', 'local_path'),
+      binary_hash: bundleValue(document, 'binaryHash', 'binary_hash'),
+      document_text: bundleValue(document, 'documentText', 'document_text'),
+      version_key: bundleValue(document, 'versionKey', 'version_key'),
+      version_label: bundleValue(document, 'versionLabel', 'version_label'),
+      supersedes_document_id: bundleValue(document, 'supersedesDocumentId', 'supersedes_document_id'),
+      visibility_status: bundleValue(document, 'visibilityStatus', 'visibility_status') || 'active',
+      not_seen_count: 0,
+      last_full_seen_at: bundle.fullCrawlSucceeded ? now : null,
+      last_seen_crawl_token: fullCrawlToken,
+    };
+    values.content_hash = bundleValue(document, 'contentHash', 'content_hash') || detailHash(values);
+    values.version_key ||= values.content_hash;
+    const old = findDocument.get(tenderId, portalFileId, filename);
+    if (old) {
+      updateDocument.run({ ...values, id: old.id, now, not_seen_count: 0 });
+      recordEntityChange('document', portalFileId,
+        old.content_hash !== values.content_hash ? 'versioned' : 'updated',
+        old.content_hash, values.content_hash);
+      if (old.visibility_status !== values.visibility_status) {
+        recordEntityChange('document', portalFileId, 'visibility_changed', old.visibility_status, values.visibility_status);
+      }
+    } else {
+      insertDocument.run({ ...values, now });
+      recordEntityChange('document', portalFileId, 'created', null, values.content_hash);
+    }
+  }
+  if (bundle.fullCrawlSucceeded === true) {
+    const unseen = db.prepare(`
+      SELECT id, portal_file_id, visibility_status, not_seen_count
+      FROM tender_documents
+      WHERE tender_id = ? AND (last_seen_crawl_token IS NULL OR last_seen_crawl_token <> ?)
+        AND visibility_status <> 'removed'
+    `).all(tenderId, now);
+    db.prepare(`
+      UPDATE tender_documents
+      SET visibility_status = 'active', not_seen_count = 0, last_full_seen_at = ?
+      WHERE tender_id = ? AND last_seen_crawl_token = ?
+    `).run(now, tenderId, fullCrawlToken);
+    db.prepare(`
+      UPDATE tender_documents
+      SET not_seen_count = not_seen_count + 1,
+          visibility_status = CASE WHEN not_seen_count + 1 >= 2 THEN 'removed' ELSE 'not_seen' END,
+          last_full_seen_at = ?
+      WHERE tender_id = ? AND (last_seen_crawl_token IS NULL OR last_seen_crawl_token <> ?)
+        AND visibility_status <> 'removed'
+    `).run(now, tenderId, fullCrawlToken);
+    for (const document of unseen) {
+      const nextStatus = document.not_seen_count + 1 >= 2 ? 'removed' : 'not_seen';
+      recordEntityChange('document', document.portal_file_id || document.id, 'visibility_changed',
+        document.visibility_status, nextStatus);
+    }
+  }
+
+  const findMessage = db.prepare(`SELECT * FROM tender_messages WHERE tender_id = ? AND portal_message_id = ? AND content_hash = ?`);
+  const insertMessage = db.prepare(`
+    INSERT INTO tender_messages (
+      tender_id, portal_message_id, subject, body, published_at, source_url, attachments_json,
+      content_hash, first_seen_at, last_seen_at
+    ) VALUES (@tender_id, @portal_message_id, @subject, @body, @published_at, @source_url,
+      @attachments_json, @content_hash, @now, @now)
+  `);
+  const updateMessage = db.prepare(`
+    UPDATE tender_messages SET subject=@subject, body=@body, published_at=@published_at,
+      source_url=@source_url, attachments_json=@attachments_json, last_seen_at=@now
+    WHERE id=@id
+  `);
+  for (const message of messages) {
+    const attachments = bundleValue(message, 'attachments');
+    const subject = bundleValue(message, 'subject', 'title');
+    const body = bundleValue(message, 'body', 'text', 'message');
+    const contentHash = bundleValue(message, 'contentHash', 'content_hash') || detailHash({ subject, body, attachments });
+    const portalMessageId = String(bundleValue(message, 'portalMessageId', 'portal_message_id', 'messageId') || `message-${contentHash.slice(0, 32)}`);
+    const values = {
+      tender_id: tenderId,
+      portal_message_id: portalMessageId,
+      subject,
+      body,
+      published_at: bundleValue(message, 'publishedAt', 'published_at', 'date'),
+      source_url: bundleValue(message, 'sourceUrl', 'source_url', 'pageUrl'),
+      attachments_json: jsonOrNull(attachments),
+      content_hash: contentHash,
+    };
+    const old = findMessage.get(tenderId, portalMessageId, contentHash);
+    if (old) {
+      updateMessage.run({ ...values, id: old.id, now });
+      recordEntityChange('message', portalMessageId, 'updated', old.content_hash, contentHash);
+    } else {
+      insertMessage.run({ ...values, now });
+      recordEntityChange('message', portalMessageId, 'created', null, contentHash);
+    }
+  }
+
+  const findSnapshot = db.prepare(`SELECT id FROM tender_snapshots WHERE tender_id = ? AND kind = ? AND content_hash = ?`);
+  const maxSnapshotVersion = db.prepare(`SELECT COALESCE(MAX(version), 0) AS version FROM tender_snapshots WHERE tender_id = ? AND kind = ?`);
+  const insertSnapshot = db.prepare(`
+    INSERT OR IGNORE INTO tender_snapshots (
+      tender_id, kind, source_url, mime_type, content, content_hash, version, fetched_at
+    ) VALUES (@tender_id, @kind, @source_url, @mime_type, @content, @content_hash, @version, @fetched_at)
+  `);
+  for (const snapshot of snapshots) {
+    const content = bundleValue(snapshot, 'content', 'text', 'html') || '';
+    const kind = String(bundleValue(snapshot, 'kind', 'section') || 'detail');
+    const contentHash = bundleValue(snapshot, 'contentHash', 'content_hash') || detailHash(content);
+    if (findSnapshot.get(tenderId, kind, contentHash)) continue;
+    const currentVersion = Number(maxSnapshotVersion.get(tenderId, kind).version || 0);
+    insertSnapshot.run({
+      tender_id: tenderId,
+      kind,
+      source_url: bundleValue(snapshot, 'sourceUrl', 'source_url', 'url'),
+      mime_type: bundleValue(snapshot, 'mimeType', 'mime_type') || 'text/html',
+      content,
+      content_hash: contentHash,
+      version: currentVersion + 1,
+      fetched_at: bundleValue(snapshot, 'fetchedAt', 'fetched_at') || now,
+    });
+    recordEntityChange('snapshot', kind, 'created', null, contentHash);
+  }
+
+  const completeness = bundle.completeness || bundle.detailCompleteness || null;
+  const overall = typeof completeness === 'string' ? completeness : completeness?.overall;
+  const detailStatus = bundle.detailStatus || (overall === 'complete' ? 'complete' : 'partial');
+  const detailCompleteness = completeness == null ? null : (typeof completeness === 'string' ? completeness : JSON.stringify(completeness));
+  const metadata = bundle.metadata == null ? null : jsonOrNull(bundle.metadata);
+  const oldTender = stmts.getTenderById.get(tenderId);
+  if (oldTender && String(oldTender.detail_status ?? '') !== String(detailStatus ?? '')) {
+    recordEntityChange('tender', 'detail_status', 'updated', oldTender.detail_status, detailStatus);
+  }
+  db.prepare(`
+    UPDATE tenders SET detail_status = COALESCE(?, detail_status), detail_crawled_at = ?,
+      detail_completeness = COALESCE(?, detail_completeness), portal_metadata_json = COALESCE(?, portal_metadata_json)
+    WHERE id = ?
+  `).run(detailStatus, now, detailCompleteness, metadata, tenderId);
+  return {
+    tenderId,
+    sections: completeness?.sections || completeness || {},
+    lots: lots.length,
+    criteria: criteria.length,
+    documents: documents.length,
+    messages: messages.length,
+    snapshots: snapshots.length,
+  };
+};
+
+const persistTenderDetailBundleTx = db.transaction(persistTenderDetailBundleRaw);
+
+export function persistTenderDetailBundle(tenderId, bundle, now = new Date().toISOString()) {
+  return persistTenderDetailBundleTx(tenderId, bundle, now);
+}
+
+export function getTenderBundleById(tenderId) {
+  const tender = stmts.getTenderById.get(tenderId);
+  if (!tender) return null;
+  const parseRows = (rows, fields = []) => rows.map((row) => {
+    const result = { ...row };
+    for (const field of fields) if (result[field]) result[field] = safeParseJson(result[field]);
+    return result;
+  });
+  const bundle = {
+    lots: parseRows(db.prepare(`SELECT * FROM tender_lots WHERE tender_id = ? ORDER BY id`).all(tenderId), ['cpv_codes', 'cpv_labels', 'metadata_json']),
+    criteria: parseRows(db.prepare(`SELECT * FROM tender_criteria WHERE tender_id = ? ORDER BY id`).all(tenderId), ['metadata_json']),
+    documents: parseRows(db.prepare(`SELECT * FROM tender_documents WHERE tender_id = ? ORDER BY id`).all(tenderId), ['locator_json']),
+    messages: parseRows(db.prepare(`SELECT * FROM tender_messages WHERE tender_id = ? ORDER BY published_at, id`).all(tenderId), ['attachments_json']),
+    snapshots: db.prepare(`SELECT * FROM tender_snapshots WHERE tender_id = ? ORDER BY kind, version`).all(tenderId),
+  };
+  bundle.metadata = safeParseJson(tender.portal_metadata_json);
+  bundle.completeness = safeParseJson(tender.detail_completeness) || tender.detail_completeness || null;
+  return bundle;
+}
+
+export function getDiscoveryCache(sourceId, portalProjectId) {
+  if (!portalProjectId) return null;
+  return db.prepare(`SELECT * FROM tender_discovery_cache WHERE source_id = ? AND portal_project_id = ?`)
+    .get(sourceId, portalProjectId);
+}
+
+export function saveDiscoveryCache({
+  sourceId,
+  portalProjectId,
+  title = null,
+  contractingAuthority = null,
+  publicationDate = null,
+  submissionDeadline = null,
+  cpvCodes = null,
+  cpvLabels = null,
+  inScope = false,
+  discoveryFingerprint = null,
+  detailAt = null,
+  detailStatus = null,
+  now = new Date().toISOString(),
+}) {
+  db.prepare(`
+    INSERT INTO tender_discovery_cache (
+      source_id, portal_project_id, title, contracting_authority, publication_date,
+      submission_deadline, cpv_codes, cpv_labels, in_scope, last_seen_at,
+      discovery_fingerprint, last_detail_at, detail_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_id, portal_project_id) DO UPDATE SET
+      title=excluded.title, contracting_authority=excluded.contracting_authority,
+      publication_date=excluded.publication_date, submission_deadline=excluded.submission_deadline,
+      cpv_codes=excluded.cpv_codes, cpv_labels=excluded.cpv_labels,
+      in_scope=excluded.in_scope, last_seen_at=excluded.last_seen_at,
+      discovery_fingerprint=excluded.discovery_fingerprint,
+      last_detail_at=COALESCE(excluded.last_detail_at, tender_discovery_cache.last_detail_at),
+      detail_status=COALESCE(excluded.detail_status, tender_discovery_cache.detail_status)
+  `).run(sourceId, portalProjectId, title, contractingAuthority, publicationDate,
+    submissionDeadline, jsonOrNull(cpvCodes), jsonOrNull(cpvLabels), inScope ? 1 : 0, now,
+    discoveryFingerprint, detailAt, detailStatus);
 }
 
 export function getTenderChanges(tenderId) {
@@ -2561,6 +3304,49 @@ export async function cleanupFundingData({ backup = true, backupPath = null } = 
   return { ...run, backupPath: madeBackup };
 }
 
+/**
+ * Setzt alle Tender-Crawls zurück: löscht sämtliche Ausschreibungen
+ * (samt Änderungshistorie und LLM-Log via FK-Kaskade), den Crawl-Verlauf,
+ * die Browser-Checkpoints und die Job-Queue – damit ein anschließender
+ * Crawl vollständig neu (inkl. Backfill) startet.
+ *
+ * Die `sources`-Tabelle und Förderdaten bleiben erhalten.
+ *
+ * Beispiele:
+ *   node src/cli-reset-crawls.js
+ *   node src/cli-reset-crawls.js --no-backup
+ */
+export async function cleanupTenderData({ backup = true, backupPath = null, sourceId = null } = {}) {
+  let madeBackup = null;
+  if (backup) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    madeBackup = backupPath || path.join(path.dirname(config.dbPath), `tender-cleanup-backup-${ts}.sqlite`);
+    await db.backup(madeBackup);
+    console.log(`[db] Sicherung erstellt: ${madeBackup}`);
+  }
+
+  const run = db.transaction(() => {
+    if (sourceId) {
+      // Nur eine Quelle: Tender dieser Quelle + deren Checkpoint + Jobs
+      const deletedTenders = db.prepare(`DELETE FROM tenders WHERE source_id = ?`).run(sourceId).changes;
+      db.prepare(`DELETE FROM crawl_checkpoints WHERE source_id = ?`).run(sourceId);
+      db.prepare(`DELETE FROM crawl_jobs WHERE source_id = ?`).run(sourceId);
+      db.exec(`INSERT INTO tenders_fts(tenders_fts) VALUES('rebuild')`);
+      return { deletedTenders };
+    }
+    // tender_changes + llm_log kaskadieren via FK ON DELETE CASCADE
+    const deletedTenders = db.prepare(`DELETE FROM tenders`).run().changes;
+    db.prepare(`DELETE FROM crawl_log`).run();
+    db.prepare(`DELETE FROM crawl_checkpoints`).run();
+    db.prepare(`DELETE FROM crawl_jobs`).run();
+    // FTS-Index neu aufbauen (nach DELETE leer)
+    db.exec(`INSERT INTO tenders_fts(tenders_fts) VALUES('rebuild')`);
+    return { deletedTenders };
+  })();
+
+  return { ...run, backupPath: madeBackup };
+}
+
 // ── Entdeckte Dokumente (Inbox) ──────────────────────────────
 
 export function addDiscoveredDocument({ sourceId, canonicalUrl, title = null, publicationDate = null, fingerprint = null }) {
@@ -2640,13 +3426,20 @@ export function updateCheckpoint(sourceId, {
 export default {
   db,
   saveTender,
+  persistTenderDetailBundle,
   getTenderById,
+  getTenderByExternalId,
+  getTenderByPortalProject,
+  getTenderBundleById,
+  getDiscoveryCache,
+  saveDiscoveryCache,
   getTenderChanges,
   getSources,
   getSource,
   updateSourceCrawlTime,
   startCrawlLog,
   finishCrawlLog,
+  updateCrawlDetailMetrics,
   updateLlmAnalysis,
   logLlmAnalysis,
   countLlmAnalysesToday,
@@ -2708,6 +3501,7 @@ export default {
   recordSourceRun,
   getSourceRuns,
   cleanupFundingData,
+  cleanupTenderData,
   // Entdeckte Dokumente
   addDiscoveredDocument,
   listDiscoveredDocuments,

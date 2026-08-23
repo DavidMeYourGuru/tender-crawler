@@ -13,6 +13,7 @@ import { getAnalysisStatus } from './llm.js';
 import {
   listTenders,
   getTenderById,
+  getTenderBundleById,
   getTenderChanges,
   getSources,
   getStats,
@@ -186,11 +187,25 @@ app.get('/api/tenders/:id', { preHandler: requireAuth }, async (request, reply) 
     return reply;
   }
   const changes = getTenderChanges(tender.id);
+  const detailBundle = getTenderBundleById(tender.id);
+  const parseJson = (value) => {
+    if (!value) return null;
+    try { return JSON.parse(value); } catch { return value; }
+  };
   return {
     ...tender,
     cpv_codes: tender.cpv_codes ? JSON.parse(tender.cpv_codes) : null,
     cpv_labels: tender.cpv_labels ? JSON.parse(tender.cpv_labels) : null,
     llm_requirements: tender.llm_requirements ? JSON.parse(tender.llm_requirements) : null,
+    portal_metadata: parseJson(tender.portal_metadata_json),
+    detail_completeness: parseJson(tender.detail_completeness),
+    detail_bundle: detailBundle,
+    lots: detailBundle?.lots || [],
+    criteria: detailBundle?.criteria || [],
+    documents: detailBundle?.documents || [],
+    messages: detailBundle?.messages || [],
+    snapshots: detailBundle?.snapshots || [],
+    completeness_status: detailBundle?.completeness || parseJson(tender.detail_completeness),
     changes,
   };
 });

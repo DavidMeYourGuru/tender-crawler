@@ -1,5 +1,5 @@
 import { httpClient, getWithRedirects } from '../crawler/http-client.js';
-import { contentHash, normalizeDate, deriveStatus } from '../utils.js';
+import { contentHash, normalizeDate, deriveStatus, normalizeCpv } from '../utils.js';
 
 export const meta = {
   id: 'dtvp',
@@ -77,6 +77,10 @@ export function parseProject(project, sourceId = 'dtvp') {
   const publicationDate = normalizeDate(project.publishingDate);
   const status = deriveStatus(deadline, 'open');
 
+  // CPV aus der List-API (Feld cpvCodes/cpvLabels; Form variiert zwischen
+  // String-Array und Objekt-Array – normalizeCpv deckt beides ab).
+  const { cpvCodes, cpvLabels } = normalizeCpv(project.cpvCodes, project.cpvLabels);
+
   return {
     sourceId,
     externalId: id,
@@ -84,8 +88,8 @@ export function parseProject(project, sourceId = 'dtvp') {
     url,
     description: null,
     contractingAuthority: project.organisationName ? String(project.organisationName).trim() : null,
-    cpvCodes: null,
-    cpvLabels: null,
+    cpvCodes,
+    cpvLabels,
     estimatedValueCents: null,
     estimatedValueCurrency: 'EUR',
     placeOfPerformance: null,
@@ -113,12 +117,21 @@ export async function discover({ maxResults = 100, rateLimiter = null } = {}) {
     let pageNumber = 1;
     const pageSize = Math.min(100, maxResults || 100);
     let hasMore = true;
+    let loggedProjectShape = false;
 
     while (hasMore && tenders.length < maxResults) {
       await rateLimiter?.acquire();
       const data = await fetchProjectsPage(token, { pageNumber, pageSize });
       const projects = data?.projects || [];
       if (!projects.length) break;
+
+      // Einmalig die rohe Projektstruktur loggen, um das CPV-Feld zu verifizieren.
+      if (!loggedProjectShape && projects[0]) {
+        loggedProjectShape = true;
+        console.log(`[dtvp] Projekt-Keys: ${Object.keys(projects[0]).join(', ')}`);
+        const sample = projects[0];
+        console.log(`[dtvp] CPV-Rohwerte: cpvCodes=${JSON.stringify(sample.cpvCodes)} cpvLabels=${JSON.stringify(sample.cpvLabels)}`);
+      }
 
       for (const project of projects) {
         const tender = parseProject(project);

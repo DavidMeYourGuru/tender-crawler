@@ -1,11 +1,10 @@
 /**
  * Kategorie-Filter für den Interessenbereich des Nutzers.
  *
- * Genutzt von den manuell zu scrapenden Quellen NRW (cosinex VMP, HTTP)
- * und Niedersachsen (Deutsche eVergabe, Browser), um die Datenmenge
- * drastisch zu reduzieren: Es werden nur Ausschreibungen aus den
- * Bereichen Landschaftsarchitektur, Garten, Bau, Schulen, Kita und
- * Spielplätze mitgenommen.
+ * Legacy-/Anwendungsfilter für Quellen, die zusätzlich zur Quellensuche
+ * lokal nach Interessen einschränken sollen. Der NRW-Adapter verwendet ihn
+ * bewusst nicht mehr: NRW wird zunächst ausschließlich über aktive CPVs
+ * vorgefiltert und innerhalb dieser Bereiche vollständig gespeichert.
  *
  * Filterlogik (ODER-Verknüpfung):
  *  - CPV-Codes (serverseitig/präzise): Bau (45xxxx), Landschaftsarchitektur
@@ -13,7 +12,8 @@
  *  - Stichworte (Substring auf Titel+Beschreibung): Schule, Kita,
  *    Kindertagesstätte, Kindergarten, Spielplatz, Schulhof, Spielgerät.
  *
- * Bewusst NICHT global angewendet – nur auf nrw + niedersachsen.
+ * Die Funktion bleibt für Niedersachsen und spätere lokale Suchfälle
+ * verfügbar, ist aber keine globale Crawl-Regel.
  */
 
 // CPV-Präfixe (erste Ziffern des 8-stelligen CPV-Codes, Versions-Suffix ignoriert).
@@ -40,7 +40,7 @@ export const INTEREST_KEYWORDS = [
 
 /**
  * Normalisiert einen CPV-Code auf seine führenden Ziffern (max. 4).
- * '45000000-7' -> '4500', '71400000-0' -> '7140'
+ * '45000000-7' -> '4500', '71400000-2' -> '7140'
  */
 function normalizeCpvPrefix(code) {
   if (!code) return '';

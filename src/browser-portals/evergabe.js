@@ -11,8 +11,7 @@ import {
   updateCheckpoint,
 } from '../db.js';
 import { RateLimiter } from '../crawler/rate-limiter.js';
-import { fetchDetail as fetchHttpDetail } from '../portals/evergabe.js';
-import { contentHash, normalizeDate, deriveStatus } from '../utils.js';
+import { contentHash, normalizeDate, deriveStatus, normalizeCpv } from '../utils.js';
 
 export const meta = {
   id: 'evergabe',
@@ -101,6 +100,47 @@ async function getNextPageUrl(page, currentPage) {
     const arrow = anchors.find((a) => /^(\s*>\s*|\s*>>\s*|\u203A|\u00BB)$/.test(a.textContent));
     return arrow ? arrow.getAttribute('href') : null;
   }, { rowSelector: ROW_SELECTOR, navLink: NAVIGATOR_LINK, currentPage });
+}
+
+/**
+ * Liest CPV-Codes/-Bezeichnungen sowie die Beschreibung aus der im Browser
+ * geöffneten eVergabe-Detailseite aus. Die Detailseite ist login-pflichtig;
+ * nur im eingeloggten Browser-Kontext (persistentes Profil) sichtbar – ein
+ * reiner HTTP-Abruf liefert die Anmelde-Maske ohne CPV.
+ *
+ * Format auf der Seite: "CPV-Codes Hauptteil (1): <Bezeichnung> (73000000-2)".
+ */
+async function extractEvergabeDetail(page, url) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(config.browserPageWaitMs);
+    return await page.evaluate(() => {
+      const text = document.body.textContent || '';
+      const cpvCodes = [];
+      const cpvLabels = [];
+      const re = /CPV-Codes?\s*(?:Hauptteil\s*\([^)]*\))?\s*:\s*([^\n(]+?)\s*\((\d{8}(?:-\d)?)\)/gi;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const label = m[1].replace(/\s+/g, ' ').trim();
+        const code = m[2];
+        if (code) cpvCodes.push(code);
+        if (label) cpvLabels.push(label);
+      }
+      let description = '';
+      for (const sel of ['.tender-detail', '.detail', '.tenderdata', 'main', 'article', '.content', '#content']) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText.trim().length > description.length) description = el.innerText.trim();
+      }
+      if (!description) description = text.slice(0, 2000).trim();
+      return {
+        cpvCodes: cpvCodes.length ? cpvCodes : null,
+        cpvLabels: cpvLabels.length ? cpvLabels : null,
+        description: description || null,
+      };
+    });
+  } catch {
+    return { cpvCodes: null, cpvLabels: null, description: null };
+  }
 }
 
 /**
@@ -225,48 +265,64 @@ export async function runEvergabeJob({ job, onProgress = () => {} } = {}) {
       pageNumber += 1;
     }
 
-    // Detail-Anreicherung nur für neue Tender (über den HTTP-Adapter, rate-limited)
+    // Detail-Anreicherung nur für neue Tender – im eingeloggten Browser, da
+    // die Detailseite login-pflichtig ist (CPV + Volltext nur dort verfügbar).
     let enriched = 0;
     if (newTenderIds.length) {
-      console.log(`[evergabe] Enrich: ${newTenderIds.length} neue Tender werden angereichert …`);
+      console.log(`[evergabe] Enrich: ${newTenderIds.length} neue Tender werden im Browser angereichert …`);
       const limit = meta.rateLimit;
       const limiter = new RateLimiter(limit.maxRequests, limit.windowMs);
-      for (const item of newTenderIds) {
-        if (job?.cancel_requested) break;
-        try {
-          // Rate-Limiting übernimmt fetchDetail intern (rateLimiter-Option)
-          const detail = await fetchHttpDetail(item.url, { rateLimiter: limiter });
-          const stored = detail?.description || detail?.documentUrl ? getTenderById(item.id) : null;
-          if (stored && detail.description && !stored.description) {
-            saveTender({
-              sourceId: stored.source_id,
-              externalId: stored.external_id,
-              title: stored.title,
-              url: stored.url,
-              description: detail.description.trim(),
-              contractingAuthority: stored.contracting_authority,
-              cpvCodes: stored.cpv_codes ? JSON.parse(stored.cpv_codes) : null,
-              cpvLabels: stored.cpv_labels ? JSON.parse(stored.cpv_labels) : null,
-              estimatedValueCents: stored.estimated_value_cents,
-              estimatedValueCurrency: stored.estimated_value_currency,
-              placeOfPerformance: stored.place_of_performance,
-              awardCriteria: null,
-              tenderType: stored.tender_type,
-              publicationDate: stored.publication_date,
-              submissionDeadline: stored.submission_deadline,
-              openingDate: null,
-              contractDuration: null,
-              documentUrl: stored.document_url,
-              status: stored.status,
-              // Listen-Hash beibehalten, damit kein Pendeln zwischen Sweep- und Enrich-Hash entsteht;
-              // die Beschreibung wird über die Feld-Änderungserkennung protokolliert.
-              contentHash: stored.content_hash,
-            });
-            enriched += 1;
+      const detailPage = await context.newPage();
+      try {
+        for (const item of newTenderIds) {
+          if (job?.cancel_requested) break;
+          try {
+            await limiter.acquire();
+            const detail = await extractEvergabeDetail(detailPage, item.url);
+            const stored = detail?.description || detail?.cpvCodes
+              ? getTenderById(item.id)
+              : null;
+            if (stored) {
+              const hasDescriptionGap = detail.description && !stored.description;
+              const hasCpvGap = (detail.cpvCodes || detail.cpvLabels) && !stored.cpv_codes;
+              if (hasDescriptionGap || hasCpvGap) {
+                const { cpvCodes, cpvLabels } = normalizeCpv(
+                  !stored.cpv_codes && detail.cpvCodes ? detail.cpvCodes : (stored.cpv_codes ? JSON.parse(stored.cpv_codes) : null),
+                  !stored.cpv_labels && detail.cpvLabels ? detail.cpvLabels : (stored.cpv_labels ? JSON.parse(stored.cpv_labels) : null)
+                );
+                saveTender({
+                  sourceId: stored.source_id,
+                  externalId: stored.external_id,
+                  title: stored.title,
+                  url: stored.url,
+                  description: hasDescriptionGap ? detail.description.trim() : stored.description,
+                  contractingAuthority: stored.contracting_authority,
+                  cpvCodes,
+                  cpvLabels,
+                  estimatedValueCents: stored.estimated_value_cents,
+                  estimatedValueCurrency: stored.estimated_value_currency,
+                  placeOfPerformance: stored.place_of_performance,
+                  awardCriteria: null,
+                  tenderType: stored.tender_type,
+                  publicationDate: stored.publication_date,
+                  submissionDeadline: stored.submission_deadline,
+                  openingDate: null,
+                  contractDuration: null,
+                  documentUrl: stored.document_url,
+                  status: stored.status,
+                  // Listen-Hash beibehalten, damit kein Pendeln zwischen Sweep- und Enrich-Hash entsteht;
+                  // die Beschreibung wird über die Feld-Änderungserkennung protokolliert.
+                  contentHash: stored.content_hash,
+                });
+                enriched += 1;
+              }
+            }
+          } catch (error) {
+            console.warn(`[evergabe] Detail-Anreicherung für ${item.id} fehlgeschlagen: ${error.message}`);
           }
-        } catch (error) {
-          console.warn(`[evergabe] Detail-Anreicherung für ${item.id} fehlgeschlagen: ${error.message}`);
         }
+      } finally {
+        await detailPage.close().catch(() => {});
       }
     }
     stats.enriched = enriched;

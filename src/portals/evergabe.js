@@ -1,6 +1,6 @@
 import * as cheerio from 'cheerio';
 import { getWithRedirects } from '../crawler/http-client.js';
-import { contentHash, normalizeDate, deriveStatus, parseMoneyToCents } from '../utils.js';
+import { contentHash, normalizeDate, deriveStatus, parseMoneyToCents, normalizeCpv } from '../utils.js';
 
 export const meta = {
   id: 'evergabe',
@@ -62,9 +62,12 @@ export function parseSearchPage(html, baseUrl = meta.baseUrl) {
     const publicationDate = normalizeDate(cellText(6));
     const text = $node.text();
 
-    // CPV / Wert, falls auf der Seite vorhanden
-    const cpvMatch = text.match(/(?:CPV|c\.pv\.)\s*-?\s*(?:Code)?\s*[::]?\s*([\d\s]{7,9})/i) || text.match(/\b(\d{8})\b/);
-    const cpvCode = cpvMatch ? cpvMatch[1].replace(/\s/g, '') : null;
+    // CPV / Wert, falls auf der Seite vorhanden.
+    // Nur als CPV werten, wenn explizit "CPV"/"c.pv." davorsteht – sonst
+    // würden beliebige 8-stellige Zahlen (Referenznummern, Datumskonkatenate)
+    // fälschlich als CPV erkannt.
+    const cpvMatch = text.match(/(?:CPV|c\.pv\.|CPV-Code)\D{0,20}?([\d\s-]{7,11})/i);
+    const cpvCode = cpvMatch ? cpvMatch[1].replace(/\D/g, '').slice(0, 8) : null;
     const moneyMatch = text.match(/(?:Wert|Auftragswert|geschätzt)\s*[::]?\s*([\d.\s.,]+)\s*(?:EUR|€)/i);
     const estimatedValueCents = moneyMatch ? parseMoneyToCents(moneyMatch[1]) : null;
 
@@ -129,11 +132,32 @@ export async function fetchDetail(url, { rateLimiter = null } = {}) {
       if (el.length > description.length) description = el;
     }
 
+    // CPV aus der Detailseite extrahieren (Code + Bezeichnung).
+    // Format auf eVergabe: "CPV-Code: 45000000-7 Bauarbeiten für Rohrleitungen".
+    const detailText = $('body').text();
+    const rawCodes = [];
+    const rawLabels = [];
+    const cpvRe = /(?:CPV-?Code|CPV)\s*[:.]?\s*(\d{8}(?:-\d)?)\s*([^\n,;]{0,160})?/gi;
+    let cm;
+    while ((cm = cpvRe.exec(detailText)) !== null) {
+      const code = cm[1];
+      let label = (cm[2] || '').replace(/^[\s:.-]+/, '').trim();
+      // Manche Portale wiederholen die Ziffer als Label – dann ignorieren.
+      if (label && label.replace(/[^0-9]/g, '').slice(0, 8) === code.replace(/[^0-9]/g, '').slice(0, 8)) {
+        label = '';
+      }
+      rawCodes.push(code);
+      if (label) rawLabels.push(label);
+    }
+    const { cpvCodes, cpvLabels } = normalizeCpv(rawCodes, rawLabels);
+
     return {
       description: description || null,
       documentUrl:
         $('a[href$=".pdf"], a[href$=".doc"], a[href$=".docx"], a[href$=".zip"], a[href$=".xlsx"], a[href$=".xls"], a[href*="downloadTenderDocument"], a[href*="Dokument"]')
           .first().attr('href') || null,
+      cpvCodes,
+      cpvLabels,
     };
   } catch (error) {
     console.error(`[evergabe] Detail abrufen fehlgeschlagen: ${url} (${error.message})`);
