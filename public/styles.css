@@ -528,6 +528,63 @@ main {
   padding: 4px 0;
 }
 
+.detail-subsection {
+  margin: 10px 0;
+}
+
+.detail-subsection h4 {
+  margin: 0 0 4px;
+  font-size: 0.85rem;
+  color: var(--on-surface-variant);
+}
+
+.detail-subsection dl {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.4fr) 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.detail-subsection dt,
+.detail-subsection dd {
+  margin: 0;
+}
+
+.detail-subsection dt {
+  color: var(--on-surface-variant);
+}
+
+.detail-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.detail-table th,
+.detail-table td {
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--outline-variant, #ddd);
+  text-align: left;
+  vertical-align: top;
+}
+
+.detail-text-section {
+  margin: 8px 0;
+  border: 1px solid var(--outline-variant, #ddd);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.detail-text-section pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+  margin: 8px 0 0;
+  font: inherit;
+}
+
 .call-fulltext {
   white-space: pre-wrap;
   word-break: break-word;

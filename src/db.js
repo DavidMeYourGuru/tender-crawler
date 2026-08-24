@@ -43,10 +43,12 @@ CREATE TABLE IF NOT EXISTS tenders (
   tender_type TEXT,
   publication_date TEXT,
   submission_deadline TEXT,
+  binding_period TEXT,
   opening_date TEXT,
   contract_duration TEXT,
   document_url TEXT,
   status TEXT NOT NULL DEFAULT 'open',
+  portal_status TEXT,
   content_hash TEXT NOT NULL,
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
@@ -275,6 +277,38 @@ CREATE TABLE IF NOT EXISTS tender_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_tender_snapshots_tender ON tender_snapshots(tender_id, kind, version);
 
+-- Aktuelle, bereinigte Abschnittstexte und sichere Label-Wert-Fakten.
+-- Roh-HTML bleibt in tender_snapshots; diese Tabellen sind bewusst current-only.
+CREATE TABLE IF NOT EXISTS tender_text_sections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  section_key TEXT NOT NULL,
+  title TEXT,
+  source_url TEXT,
+  text TEXT,
+  status TEXT NOT NULL DEFAULT 'complete',
+  content_hash TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,
+  UNIQUE(tender_id, section_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_text_sections_tender ON tender_text_sections(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_facts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+  fact_key TEXT NOT NULL,
+  section_key TEXT,
+  label TEXT NOT NULL,
+  value_text TEXT,
+  normalized_value_json TEXT,
+  data_type TEXT,
+  source_url TEXT,
+  content_hash TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,
+  UNIQUE(tender_id, fact_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_facts_tender ON tender_facts(tender_id);
+
 CREATE TABLE IF NOT EXISTS tender_discovery_cache (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -303,7 +337,9 @@ CREATE TABLE IF NOT EXISTS tender_migration_log (
 );
 `);
 
-// FTS5 Volltextsuche – muss nach dem Erstellen von tenders ausgeführt werden
+// FTS5 Volltextsuche – muss nach dem Erstellen von tenders ausgeführt werden.
+// `search_text_full` ist absichtlich ein eigenes FTS-Feld: Der aggregierte
+// Detailtext kann deutlich mehr enthalten als die kurzen Kernspalten.
 db.exec(`
 CREATE VIRTUAL TABLE IF NOT EXISTS tenders_fts USING fts5(
   title,
@@ -311,6 +347,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS tenders_fts USING fts5(
   contracting_authority,
   cpv_labels,
   place_of_performance,
+  search_text_full,
   content='tenders',
   content_rowid='id'
 );
@@ -614,6 +651,8 @@ ensureColumn('tenders', 'portal_project_id', 'TEXT');
 ensureColumn('tenders', 'reference_number', 'TEXT');
 ensureColumn('tenders', 'procedure_type', 'TEXT');
 ensureColumn('tenders', 'question_deadline', 'TEXT');
+ensureColumn('tenders', 'binding_period', 'TEXT');
+ensureColumn('tenders', 'portal_status', 'TEXT');
 ensureColumn('tenders', 'detail_status', 'TEXT');
 ensureColumn('tenders', 'detail_crawled_at', 'TEXT');
 ensureColumn('tenders', 'detail_completeness', 'TEXT');
@@ -630,6 +669,7 @@ ensureColumn('tender_documents', 'visibility_status', "TEXT NOT NULL DEFAULT 'ac
 ensureColumn('tender_documents', 'not_seen_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('tender_documents', 'last_full_seen_at', 'TEXT');
 ensureColumn('tender_documents', 'last_seen_crawl_token', 'TEXT');
+ensureColumn('tender_snapshots', 'version', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('tender_discovery_cache', 'discovery_fingerprint', 'TEXT');
 ensureColumn('tender_discovery_cache', 'last_detail_at', 'TEXT');
 ensureColumn('tender_discovery_cache', 'detail_status', 'TEXT');
@@ -641,6 +681,43 @@ ensureColumn('crawl_log', 'documents_inventoried', 'INTEGER NOT NULL DEFAULT 0')
 ensureColumn('crawl_log', 'messages_inventoried', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('crawl_log', 'login_required', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('crawl_log', 'unknown_portal_structure', 'INTEGER NOT NULL DEFAULT 0');
+
+// Bestehende Installationen haben einen FTS5-Index ohne `search_text_full`.
+// FTS5 kann Spalten nicht per ALTER TABLE erweitern; der abgeleitete Index
+// wird deshalb sicher (und ohne Nutzdatenverlust) neu angelegt. Die Trigger
+// werden immer neu definiert, damit auch ein bereits migrierter Index die
+// Volltextspalte bei INSERT/UPDATE synchron hält.
+const tenderFtsColumns = db.prepare(`PRAGMA table_info(tenders_fts)`).all();
+const tenderFtsNeedsMigration = tenderFtsColumns.length > 0
+  && !tenderFtsColumns.some((column) => column.name === 'search_text_full');
+db.exec(`DROP TRIGGER IF EXISTS tenders_ai; DROP TRIGGER IF EXISTS tenders_ad; DROP TRIGGER IF EXISTS tenders_au;`);
+if (tenderFtsNeedsMigration) {
+  db.exec(`DROP TABLE IF EXISTS tenders_fts;`);
+}
+db.exec(`
+CREATE VIRTUAL TABLE IF NOT EXISTS tenders_fts USING fts5(
+  title, description, contracting_authority, cpv_labels,
+  place_of_performance, search_text_full,
+  content='tenders', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS tenders_ai AFTER INSERT ON tenders BEGIN
+  INSERT INTO tenders_fts(rowid, title, description, contracting_authority, cpv_labels, place_of_performance, search_text_full)
+  VALUES (new.id, new.title, COALESCE(new.description,''), COALESCE(new.contracting_authority,''), COALESCE(new.cpv_labels,''), COALESCE(new.place_of_performance,''), COALESCE(new.search_text_full,''));
+END;
+CREATE TRIGGER IF NOT EXISTS tenders_ad AFTER DELETE ON tenders BEGIN
+  INSERT INTO tenders_fts(tenders_fts, rowid, title, description, contracting_authority, cpv_labels, place_of_performance, search_text_full)
+  VALUES ('delete', old.id, old.title, COALESCE(old.description,''), COALESCE(old.contracting_authority,''), COALESCE(old.cpv_labels,''), COALESCE(old.place_of_performance,''), COALESCE(old.search_text_full,''));
+END;
+CREATE TRIGGER IF NOT EXISTS tenders_au AFTER UPDATE ON tenders BEGIN
+  INSERT INTO tenders_fts(tenders_fts, rowid, title, description, contracting_authority, cpv_labels, place_of_performance, search_text_full)
+  VALUES ('delete', old.id, old.title, COALESCE(old.description,''), COALESCE(old.contracting_authority,''), COALESCE(old.cpv_labels,''), COALESCE(old.place_of_performance,''), COALESCE(old.search_text_full,''));
+  INSERT INTO tenders_fts(rowid, title, description, contracting_authority, cpv_labels, place_of_performance, search_text_full)
+  VALUES (new.id, new.title, COALESCE(new.description,''), COALESCE(new.contracting_authority,''), COALESCE(new.cpv_labels,''), COALESCE(new.place_of_performance,''), COALESCE(new.search_text_full,''));
+END;
+`);
+// Ein Rebuild ist bei der Migration erforderlich; bei einem bereits neuen
+// Index stellt er nach manuellen DB-Reparaturen ebenfalls Konsistenz her.
+db.exec(`INSERT INTO tenders_fts(tenders_fts) VALUES ('rebuild');`);
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tenders_source_portal_project
   ON tenders(source_id, portal_project_id) WHERE portal_project_id IS NOT NULL`);
 
@@ -877,8 +954,8 @@ export const stmts = {
       source_id, external_id, title, url, description, contracting_authority,
       cpv_codes, cpv_labels, estimated_value_cents, estimated_value_currency,
       place_of_performance, award_criteria, tender_type, publication_date,
-      submission_deadline, opening_date, contract_duration, document_url,
-      status, content_hash, search_text_full, portal_project_id, reference_number,
+      submission_deadline, binding_period, opening_date, contract_duration, document_url,
+      status, portal_status, content_hash, search_text_full, portal_project_id, reference_number,
       procedure_type, question_deadline, detail_status, detail_crawled_at,
       detail_completeness, portal_metadata_json, detail_crawl_kind, last_full_seen_at,
       first_seen_at, last_seen_at, last_changed_at
@@ -886,8 +963,8 @@ export const stmts = {
       @source_id, @external_id, @title, @url, @description, @contracting_authority,
       @cpv_codes, @cpv_labels, @estimated_value_cents, @estimated_value_currency,
       @place_of_performance, @award_criteria, @tender_type, @publication_date,
-      @submission_deadline, @opening_date, @contract_duration, @document_url,
-      @status, @content_hash, @search_text_full, @portal_project_id, @reference_number,
+      @submission_deadline, @binding_period, @opening_date, @contract_duration, @document_url,
+      @status, @portal_status, @content_hash, @search_text_full, @portal_project_id, @reference_number,
       @procedure_type, @question_deadline, @detail_status, @detail_crawled_at,
       @detail_completeness, @portal_metadata_json, @detail_crawl_kind, @last_full_seen_at,
       @now, @now, @now
@@ -909,10 +986,12 @@ export const stmts = {
       tender_type = COALESCE(@tender_type, tender_type),
       publication_date = COALESCE(@publication_date, publication_date),
       submission_deadline = COALESCE(@submission_deadline, submission_deadline),
+      binding_period = COALESCE(@binding_period, binding_period),
       opening_date = COALESCE(@opening_date, opening_date),
       contract_duration = COALESCE(@contract_duration, contract_duration),
       document_url = COALESCE(@document_url, document_url),
       status = @status,
+      portal_status = COALESCE(@portal_status, portal_status),
       content_hash = @content_hash,
       search_text_full = COALESCE(@search_text_full, search_text_full),
       portal_project_id = COALESCE(@portal_project_id, portal_project_id),
@@ -1377,6 +1456,7 @@ function tenderContentHash(fields) {
     type: fields.tender_type,
     publication: fields.publication_date,
     deadline: fields.submission_deadline,
+    bindingPeriod: fields.binding_period,
     opening: fields.opening_date,
     duration: fields.contract_duration,
     document: fields.document_url,
@@ -1385,6 +1465,7 @@ function tenderContentHash(fields) {
     procedureType: fields.procedure_type,
     questionDeadline: fields.question_deadline,
     metadata: fields.portal_metadata_json,
+    portalStatus: fields.portal_status,
   };
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
@@ -1457,10 +1538,12 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
     tender_type: effectiveValue(tender.tenderType, existing?.tender_type),
     publication_date: effectiveValue(tender.publicationDate, existing?.publication_date),
     submission_deadline: effectiveValue(tender.submissionDeadline, existing?.submission_deadline),
+    binding_period: effectiveValue(tender.bindingPeriod, existing?.binding_period),
     opening_date: effectiveValue(tender.openingDate, existing?.opening_date),
     contract_duration: effectiveValue(tender.contractDuration, existing?.contract_duration),
     document_url: effectiveValue(tender.documentUrl, existing?.document_url),
     status: effectiveValue(tender.status, existing?.status, 'open'),
+    portal_status: effectiveValue(tender.portalStatus, existing?.portal_status),
     portal_project_id: effectiveValue(tender.portalProjectId, existing?.portal_project_id),
     reference_number: effectiveValue(tender.referenceNumber, existing?.reference_number),
     procedure_type: effectiveValue(tender.procedureType, existing?.procedure_type),
@@ -1493,6 +1576,8 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
     llmSummary: tender.llmSummary ?? existing?.llm_summary ?? null,
     llmRequirements: tender.llmRequirements
       ?? (existing?.llm_requirements ? safeParseJson(existing.llm_requirements) : null),
+    textSections: detailBundle?.textSections || [],
+    facts: detailBundle?.facts || [],
   });
 
   if (!existing) {
@@ -1500,7 +1585,7 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
     const tenderId = Number(result.lastInsertRowid);
     saveSourceDocument({
       docKind: 'tender', entityId: tenderId, canonicalUrl: effective.url,
-      documentTitle: effective.title, content: effective.search_text_full,
+      documentTitle: effective.title, content: effective.search_text_full, replaceCurrent: true,
     });
     if (detailBundle) persistTenderDetailBundleRaw(tenderId, detailBundle, now);
     return { isNew: true, changed: true, tenderId, changes: [{ field: 'created', oldValue: null, newValue: effective.title }] };
@@ -1511,6 +1596,7 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
     ['title', existing.title, effective.title],
     ['status', existing.status, effective.status],
     ['submission_deadline', existing.submission_deadline, effective.submission_deadline],
+    ['binding_period', existing.binding_period, effective.binding_period],
     ['estimated_value_cents', existing.estimated_value_cents, effective.estimated_value_cents],
     ['contracting_authority', existing.contracting_authority, effective.contracting_authority],
     ['description', existing.description, effective.description],
@@ -1529,6 +1615,7 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
     ['procedure_type', existing.procedure_type, effective.procedure_type],
     ['question_deadline', existing.question_deadline, effective.question_deadline],
     ['detail_status', existing.detail_status, effective.detail_status],
+    ['portal_status', existing.portal_status, effective.portal_status],
     ['detail_completeness', existing.detail_completeness, effective.detail_completeness],
     ['detail_crawl_kind', existing.detail_crawl_kind, effective.detail_crawl_kind],
     ['portal_metadata_json', existing.portal_metadata_json, effective.portal_metadata_json],
@@ -1551,7 +1638,7 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
   if (changed) {
     saveSourceDocument({
       docKind: 'tender', entityId: existing.id, canonicalUrl: effective.url,
-      documentTitle: effective.title, content: effective.search_text_full,
+      documentTitle: effective.title, content: effective.search_text_full, replaceCurrent: true,
     });
   }
   if (detailBundle) persistTenderDetailBundleRaw(existing.id, detailBundle, now);
@@ -1595,6 +1682,8 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
   const documents = Array.isArray(bundle.documents) ? bundle.documents : [];
   const messages = Array.isArray(bundle.messages) ? bundle.messages : [];
   const snapshots = Array.isArray(bundle.snapshots) ? bundle.snapshots : [];
+  const textSections = Array.isArray(bundle.textSections) ? bundle.textSections : [];
+  const facts = Array.isArray(bundle.facts) ? bundle.facts : [];
   // ISO-Zeitstempel haben Millisekundenauflösung. Zwei schnelle Vollcrawls
   // dürfen trotzdem nicht denselben "gesehen"-Marker verwenden, sonst kann
   // ein Dokument in einem Lauf doppelt als fehlend gezählt werden.
@@ -1611,7 +1700,89 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
     );
   };
 
+  const findTextSection = db.prepare(`SELECT * FROM tender_text_sections WHERE tender_id = ? AND section_key = ?`);
+  const upsertTextSection = db.prepare(`
+    INSERT INTO tender_text_sections (
+      tender_id, section_key, title, source_url, text, status, content_hash, fetched_at
+    ) VALUES (@tender_id, @section_key, @title, @source_url, @text, @status, @content_hash, @now)
+    ON CONFLICT(tender_id, section_key) DO UPDATE SET
+      title=excluded.title, source_url=excluded.source_url, text=excluded.text,
+      status=excluded.status, content_hash=excluded.content_hash, fetched_at=excluded.fetched_at
+  `);
+  const seenSectionKeys = new Set();
+  for (const section of textSections) {
+    const sectionKey = String(bundleValue(section, 'sectionKey', 'section_key', 'kind', 'key') || 'detail');
+    const text = String(bundleValue(section, 'text', 'content', 'rawText', 'raw_text') || '');
+    const values = {
+      tender_id: tenderId,
+      section_key: sectionKey,
+      title: bundleValue(section, 'title', 'heading', 'label'),
+      source_url: bundleValue(section, 'sourceUrl', 'source_url', 'url'),
+      text,
+      status: bundleValue(section, 'status') || 'complete',
+      content_hash: bundleValue(section, 'contentHash', 'content_hash') || detailHash(text),
+    };
+    const old = findTextSection.get(tenderId, sectionKey);
+    upsertTextSection.run({ ...values, now });
+    recordEntityChange('text_section', sectionKey, old ? 'updated' : 'created', old?.content_hash, values.content_hash);
+    seenSectionKeys.add(sectionKey);
+  }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'textSections')) {
+    const staleSections = db.prepare(`SELECT section_key, content_hash FROM tender_text_sections WHERE tender_id = ?`).all(tenderId);
+    const removeSection = db.prepare(`DELETE FROM tender_text_sections WHERE tender_id = ? AND section_key = ?`);
+    for (const section of staleSections) {
+      if (seenSectionKeys.has(section.section_key)) continue;
+      removeSection.run(tenderId, section.section_key);
+      recordEntityChange('text_section', section.section_key, 'removed', section.content_hash, null);
+    }
+  }
+
+  const findFact = db.prepare(`SELECT * FROM tender_facts WHERE tender_id = ? AND fact_key = ?`);
+  const upsertFact = db.prepare(`
+    INSERT INTO tender_facts (
+      tender_id, fact_key, section_key, label, value_text, normalized_value_json,
+      data_type, source_url, content_hash, fetched_at
+    ) VALUES (@tender_id, @fact_key, @section_key, @label, @value_text, @normalized_value_json,
+      @data_type, @source_url, @content_hash, @now)
+    ON CONFLICT(tender_id, fact_key) DO UPDATE SET
+      section_key=excluded.section_key, label=excluded.label, value_text=excluded.value_text,
+      normalized_value_json=excluded.normalized_value_json, data_type=excluded.data_type,
+      source_url=excluded.source_url, content_hash=excluded.content_hash, fetched_at=excluded.fetched_at
+  `);
+  const seenFactKeys = new Set();
+  for (const fact of facts) {
+    const factKey = String(bundleValue(fact, 'factKey', 'fact_key', 'key') || `fact-${detailHash(fact).slice(0, 32)}`);
+    const label = String(bundleValue(fact, 'label', 'name', 'title') || factKey);
+    const valueText = bundleValue(fact, 'valueText', 'value_text', 'value', 'text');
+    const normalizedValue = bundleValue(fact, 'normalizedValue', 'normalized_value', 'normalizedValueJson', 'normalized_value_json');
+    const values = {
+      tender_id: tenderId,
+      fact_key: factKey,
+      section_key: bundleValue(fact, 'sectionKey', 'section_key', 'section'),
+      label,
+      value_text: valueText == null ? null : String(valueText),
+      normalized_value_json: normalizedValue == null ? null : jsonOrNull(normalizedValue),
+      data_type: bundleValue(fact, 'dataType', 'data_type', 'type'),
+      source_url: bundleValue(fact, 'sourceUrl', 'source_url', 'url'),
+    };
+    values.content_hash = bundleValue(fact, 'contentHash', 'content_hash') || detailHash(values);
+    const old = findFact.get(tenderId, factKey);
+    upsertFact.run({ ...values, now });
+    recordEntityChange('fact', factKey, old ? 'updated' : 'created', old?.content_hash, values.content_hash);
+    seenFactKeys.add(factKey);
+  }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'facts')) {
+    const staleFacts = db.prepare(`SELECT fact_key, content_hash FROM tender_facts WHERE tender_id = ?`).all(tenderId);
+    const removeFact = db.prepare(`DELETE FROM tender_facts WHERE tender_id = ? AND fact_key = ?`);
+    for (const fact of staleFacts) {
+      if (seenFactKeys.has(fact.fact_key)) continue;
+      removeFact.run(tenderId, fact.fact_key);
+      recordEntityChange('fact', fact.fact_key, 'removed', fact.content_hash, null);
+    }
+  }
+
   const lotIdByKey = new Map();
+  const seenLotKeys = new Set();
   const findLot = db.prepare(`SELECT * FROM tender_lots WHERE tender_id = ? AND lot_key = ?`);
   const insertLot = db.prepare(`
     INSERT INTO tender_lots (
@@ -1662,9 +1833,19 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
       recordEntityChange('lot', lotKey, 'created', null, values.content_hash);
       lotIdByKey.set(lotKey, Number(result.lastInsertRowid));
     }
+    seenLotKeys.add(lotKey);
+  }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'lots')) {
+    const staleLots = db.prepare(`SELECT lot_key, content_hash FROM tender_lots WHERE tender_id = ?`).all(tenderId);
+    for (const lot of staleLots) {
+      if (seenLotKeys.has(lot.lot_key)) continue;
+      db.prepare(`DELETE FROM tender_lots WHERE tender_id = ? AND lot_key = ?`).run(tenderId, lot.lot_key);
+      recordEntityChange('lot', lot.lot_key, 'removed', lot.content_hash, null);
+    }
   }
 
   const findCriterion = db.prepare(`SELECT * FROM tender_criteria WHERE tender_id = ? AND criterion_key = ?`);
+  const seenCriterionKeys = new Set();
   const insertCriterion = db.prepare(`
     INSERT INTO tender_criteria (
       tender_id, lot_id, criterion_key, kind, code, title, description, weight,
@@ -1709,6 +1890,15 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
     } else {
       insertCriterion.run({ ...values, now });
       recordEntityChange('criterion', criterionKey, 'created', null, values.content_hash);
+    }
+    seenCriterionKeys.add(criterionKey);
+  }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'criteria')) {
+    const staleCriteria = db.prepare(`SELECT criterion_key, content_hash FROM tender_criteria WHERE tender_id = ?`).all(tenderId);
+    for (const criterion of staleCriteria) {
+      if (seenCriterionKeys.has(criterion.criterion_key)) continue;
+      db.prepare(`DELETE FROM tender_criteria WHERE tender_id = ? AND criterion_key = ?`).run(tenderId, criterion.criterion_key);
+      recordEntityChange('criterion', criterion.criterion_key, 'removed', criterion.content_hash, null);
     }
   }
 
@@ -1792,7 +1982,7 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
       FROM tender_documents
       WHERE tender_id = ? AND (last_seen_crawl_token IS NULL OR last_seen_crawl_token <> ?)
         AND visibility_status <> 'removed'
-    `).all(tenderId, now);
+    `).all(tenderId, fullCrawlToken);
     db.prepare(`
       UPDATE tender_documents
       SET visibility_status = 'active', not_seen_count = 0, last_full_seen_at = ?
@@ -1814,6 +2004,7 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
   }
 
   const findMessage = db.prepare(`SELECT * FROM tender_messages WHERE tender_id = ? AND portal_message_id = ? AND content_hash = ?`);
+  const seenMessageIds = new Set();
   const insertMessage = db.prepare(`
     INSERT INTO tender_messages (
       tender_id, portal_message_id, subject, body, published_at, source_url, attachments_json,
@@ -1832,6 +2023,7 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
     const body = bundleValue(message, 'body', 'text', 'message');
     const contentHash = bundleValue(message, 'contentHash', 'content_hash') || detailHash({ subject, body, attachments });
     const portalMessageId = String(bundleValue(message, 'portalMessageId', 'portal_message_id', 'messageId') || `message-${contentHash.slice(0, 32)}`);
+    seenMessageIds.add(portalMessageId);
     const values = {
       tender_id: tenderId,
       portal_message_id: portalMessageId,
@@ -1851,20 +2043,29 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
       recordEntityChange('message', portalMessageId, 'created', null, contentHash);
     }
   }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'messages')) {
+    const staleMessages = db.prepare(`SELECT id, portal_message_id, content_hash FROM tender_messages WHERE tender_id = ?`).all(tenderId);
+    for (const message of staleMessages) {
+      if (seenMessageIds.has(String(message.portal_message_id || ''))) continue;
+      db.prepare(`DELETE FROM tender_messages WHERE id = ?`).run(message.id);
+      recordEntityChange('message', message.portal_message_id || message.id, 'removed', message.content_hash, null);
+    }
+  }
 
-  const findSnapshot = db.prepare(`SELECT id FROM tender_snapshots WHERE tender_id = ? AND kind = ? AND content_hash = ?`);
-  const maxSnapshotVersion = db.prepare(`SELECT COALESCE(MAX(version), 0) AS version FROM tender_snapshots WHERE tender_id = ? AND kind = ?`);
+  const findSnapshot = db.prepare(`SELECT id, content_hash FROM tender_snapshots WHERE tender_id = ? AND kind = ? ORDER BY version DESC, id DESC LIMIT 1`);
+  const deleteSnapshots = db.prepare(`DELETE FROM tender_snapshots WHERE tender_id = ? AND kind = ?`);
   const insertSnapshot = db.prepare(`
-    INSERT OR IGNORE INTO tender_snapshots (
+    INSERT INTO tender_snapshots (
       tender_id, kind, source_url, mime_type, content, content_hash, version, fetched_at
-    ) VALUES (@tender_id, @kind, @source_url, @mime_type, @content, @content_hash, @version, @fetched_at)
+    ) VALUES (@tender_id, @kind, @source_url, @mime_type, @content, @content_hash, 1, @fetched_at)
   `);
   for (const snapshot of snapshots) {
     const content = bundleValue(snapshot, 'content', 'text', 'html') || '';
     const kind = String(bundleValue(snapshot, 'kind', 'section') || 'detail');
     const contentHash = bundleValue(snapshot, 'contentHash', 'content_hash') || detailHash(content);
-    if (findSnapshot.get(tenderId, kind, contentHash)) continue;
-    const currentVersion = Number(maxSnapshotVersion.get(tenderId, kind).version || 0);
+    const previous = findSnapshot.get(tenderId, kind);
+    if (previous?.content_hash === contentHash) continue;
+    deleteSnapshots.run(tenderId, kind);
     insertSnapshot.run({
       tender_id: tenderId,
       kind,
@@ -1872,11 +2073,44 @@ const persistTenderDetailBundleRaw = (tenderId, bundle, now) => {
       mime_type: bundleValue(snapshot, 'mimeType', 'mime_type') || 'text/html',
       content,
       content_hash: contentHash,
-      version: currentVersion + 1,
       fetched_at: bundleValue(snapshot, 'fetchedAt', 'fetched_at') || now,
     });
-    recordEntityChange('snapshot', kind, 'created', null, contentHash);
+    recordEntityChange('snapshot', kind, previous ? 'updated' : 'created', previous?.content_hash, contentHash);
   }
+  if (bundle.fullCrawlSucceeded === true && Object.prototype.hasOwnProperty.call(bundle, 'snapshots')) {
+    const seenSnapshotKinds = new Set(snapshots.map((snapshot) => String(bundleValue(snapshot, 'kind', 'section') || 'detail')));
+    const staleSnapshots = db.prepare(`SELECT kind, content_hash FROM tender_snapshots WHERE tender_id = ?`).all(tenderId);
+    for (const snapshot of staleSnapshots) {
+      if (seenSnapshotKinds.has(snapshot.kind)) continue;
+      db.prepare(`DELETE FROM tender_snapshots WHERE tender_id = ? AND kind = ?`).run(tenderId, snapshot.kind);
+      recordEntityChange('snapshot', snapshot.kind, 'removed', snapshot.content_hash, null);
+    }
+  }
+
+  // Der lokale Suchtext enthält nach einer Detailanreicherung auch die
+  // aktuellen Abschnittstexte und generischen Fakten. Tender-Quelldokumente
+  // werden bewusst current-only gehalten; Förderprogramm-Versionen bleiben
+  // von dieser Regel unberührt.
+  const currentTender = stmts.getTenderById.get(tenderId);
+  const currentSections = db.prepare(`SELECT section_key, title, text FROM tender_text_sections WHERE tender_id = ? ORDER BY section_key`).all(tenderId);
+  const currentFacts = db.prepare(`SELECT section_key, label, value_text FROM tender_facts WHERE tender_id = ? ORDER BY section_key, label`).all(tenderId);
+  const aggregateSearchText = buildTenderSearchText({
+    title: currentTender?.title,
+    description: currentTender?.description,
+    contractingAuthority: currentTender?.contracting_authority,
+    cpvLabels: safeParseJson(currentTender?.cpv_labels),
+    placeOfPerformance: currentTender?.place_of_performance,
+    bindingPeriod: currentTender?.binding_period,
+    portalStatus: currentTender?.portal_status,
+    awardCriteria: currentTender?.award_criteria,
+    textSections: currentSections,
+    facts: currentFacts,
+  });
+  db.prepare(`UPDATE tenders SET search_text_full = ? WHERE id = ?`).run(aggregateSearchText, tenderId);
+  saveSourceDocument({
+    docKind: 'tender', entityId: tenderId, canonicalUrl: currentTender?.url,
+    documentTitle: currentTender?.title, content: aggregateSearchText, replaceCurrent: true,
+  });
 
   const completeness = bundle.completeness || bundle.detailCompleteness || null;
   const overall = typeof completeness === 'string' ? completeness : completeness?.overall;
@@ -1923,6 +2157,8 @@ export function getTenderBundleById(tenderId) {
     documents: parseRows(db.prepare(`SELECT * FROM tender_documents WHERE tender_id = ? ORDER BY id`).all(tenderId), ['locator_json']),
     messages: parseRows(db.prepare(`SELECT * FROM tender_messages WHERE tender_id = ? ORDER BY published_at, id`).all(tenderId), ['attachments_json']),
     snapshots: db.prepare(`SELECT * FROM tender_snapshots WHERE tender_id = ? ORDER BY kind, version`).all(tenderId),
+    textSections: db.prepare(`SELECT * FROM tender_text_sections WHERE tender_id = ? ORDER BY section_key`).all(tenderId),
+    facts: parseRows(db.prepare(`SELECT * FROM tender_facts WHERE tender_id = ? ORDER BY section_key, label, fact_key`).all(tenderId), ['normalized_value_json']),
   };
   bundle.metadata = safeParseJson(tender.portal_metadata_json);
   bundle.completeness = safeParseJson(tender.detail_completeness) || tender.detail_completeness || null;
@@ -2812,10 +3048,18 @@ export function buildTenderSearchText(tender) {
     tender.contractingAuthority,
     tender.cpvLabels ? (Array.isArray(tender.cpvLabels) ? tender.cpvLabels.join(' ') : String(tender.cpvLabels)) : null,
     tender.placeOfPerformance,
+    tender.bindingPeriod,
+    tender.portalStatus,
     tender.llmSummary,
     tender.llmRequirements ? (Array.isArray(tender.llmRequirements) ? tender.llmRequirements.join(' ') : String(tender.llmRequirements)) : null,
     tender.awardCriteria,
   ];
+  for (const section of tender.textSections || []) {
+    parts.push(section.text ?? section.content ?? section.rawText);
+  }
+  for (const fact of tender.facts || []) {
+    parts.push(fact.label, fact.valueText ?? fact.value_text ?? fact.value);
+  }
   return parts.map(normSearchPart).filter(Boolean).join(' | ');
 }
 
@@ -2955,15 +3199,19 @@ const getLatestSourceDocument = db.prepare(`
  * Speichert ein Rohdokument und erzeugt daraus strukturorientierte Chunks.
  * Bei identischem Inhalt-Hash wird die Version nicht erhöht.
  */
-export function saveSourceDocument({ docKind, entityId, canonicalUrl, mimeType = 'text/html', documentTitle = null, content }) {
+export function saveSourceDocument({ docKind, entityId, canonicalUrl, mimeType = 'text/html', documentTitle = null, content, replaceCurrent = false }) {
   const url = canonicalUrl || `${docKind}:${entityId ?? 'unknown'}`;
   const contentHash = createHash('sha256').update(String(content || '')).digest('hex');
   const latest = getLatestSourceDocument.get(docKind, entityId);
-  let docVersion = latest ? latest.doc_version : 0;
-  if (latest && latest.content_hash === contentHash) {
+  if (replaceCurrent && latest) {
+    db.prepare(`DELETE FROM source_documents WHERE doc_kind = ? AND entity_id = ?`).run(docKind, entityId);
+    db.prepare(`DELETE FROM document_chunks WHERE doc_kind = ? AND entity_id = ?`).run(docKind, entityId);
+  }
+  let docVersion;
+  if (!replaceCurrent && latest && latest.content_hash === contentHash) {
     return { docVersion: latest.doc_version, changed: false };
   }
-  docVersion += 1;
+  docVersion = replaceCurrent ? 1 : (latest ? latest.doc_version + 1 : 1);
   const fetchedAt = new Date().toISOString();
   insertSourceDocument.run({
     doc_kind: docKind,
@@ -3013,12 +3261,14 @@ export function backfillSearchText() {
         contractingAuthority: t.contracting_authority,
         cpvLabels: t.cpv_labels ? JSON.parse(t.cpv_labels) : null,
         placeOfPerformance: t.place_of_performance,
+        bindingPeriod: t.binding_period,
+        portalStatus: t.portal_status,
         llmSummary: t.llm_summary,
         llmRequirements: t.llm_requirements ? JSON.parse(t.llm_requirements) : null,
         awardCriteria: t.award_criteria,
       });
       upTender.run(text, t.id);
-      saveSourceDocument({ docKind: 'tender', entityId: t.id, canonicalUrl: t.url, documentTitle: t.title, content: text });
+      saveSourceDocument({ docKind: 'tender', entityId: t.id, canonicalUrl: t.url, documentTitle: t.title, content: text, replaceCurrent: true });
       updated += 1;
     }
 

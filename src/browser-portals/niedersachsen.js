@@ -39,6 +39,7 @@ import {
 import { RateLimiter } from '../crawler/rate-limiter.js';
 import { contentHash, normalizeDate, deriveStatus } from '../utils.js';
 import { matchesInterestCategories } from '../category-filter.js';
+import { cleanDetailText, extractFactsFromDom, makeFact, makeTextSection, uniqueFacts } from '../detail-data.js';
 
 export const meta = {
   id: 'niedersachsen',
@@ -60,6 +61,20 @@ const REJECTED_CACHE_REFRESH_MS = 30 * 24 * 60 * 60 * 1000;
 const OPEN_DETAIL_REFRESH_MS = 24 * 60 * 60 * 1000;
 const CLOSED_DETAIL_REFRESH_MS = 7 * 24 * 60 * 60 * 1000;
 
+function parseGermanAmountCents(value) {
+  if (!value) return null;
+  const normalized = String(value).replace(/\s/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.').replace(/[^\d.-]/g, '');
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : null;
+}
+
+function isDeferredDocumentRequest(url) {
+  const value = String(url || '');
+  return /\.(?:pdf|docx?|xlsx?|zip|7z|rar|odt|ods|txt|rtf)(?:$|[?#])/i.test(value)
+    || /(?:^|[/?_.?&-])(?:directdocload|download(?:document|file)?|filedownload)(?:[/?_.?&=-]|$)/i.test(value)
+    || /(?:[?&](?:download|downloadFile|fileDownload|inlineFile)(?:=true)?(?:&|$))/i.test(value);
+}
+
 function detailDue(existing, now = Date.now()) {
   if (!existing?.detail_crawled_at || existing.detail_status !== 'complete') return true;
   const crawled = Date.parse(existing.detail_crawled_at);
@@ -74,6 +89,19 @@ function isSpecificProjectTitle(value) {
   if (!title || /^(?:verfahren|zusammenfassung|bekanntmachung|dokumente?)$/i.test(title)) return false;
   if (/^(?:verfahren\s*)?(?:nr\.?|nummer)\s*[\w/-]+$/i.test(title)) return false;
   return title.length >= 5;
+}
+
+// Kernfelder sind durch die Portalbezeichnungen semantisch bekannt. Sie
+// werden als Fakten nur für diese Whitelist materialisiert; unbekannte
+// `Label: Wert`-Zeilen bleiben ausschließlich im Abschnittstext.
+function knownSummaryFacts(summary, sourceUrl) {
+  const fields = ['referenceNumber', 'contractingAuthority', 'procedureType', 'procurementRegulation',
+    'publicationDate', 'submissionDeadline', 'questionDeadline', 'openingDate', 'bindingPeriod',
+    'description', 'placeOfPerformance', 'contractDuration', 'awardCriteria', 'portalStatus'];
+  return fields.map((key) => makeFact({
+    sectionKey: 'summary', key: `summary:${key}`, label: key, value: summary[key],
+    normalizedValue: summary[key], dataType: 'known_field', sourceUrl,
+  })).filter(Boolean);
 }
 
 export function profileDir() {
@@ -212,7 +240,7 @@ export function parseDetailSummaryHtml(html, baseUrl = DASHBOARD_URL) {
   const cpvLabels = cpvPairs.map((pair) => pair.label).filter(Boolean);
   const valueAfter = (labels) => {
     for (const label of labels) {
-      const match = text.match(new RegExp(`${label}\\s*:?\\s*(.{1,180}?)(?=\\s+(?:\u00d6ffentlich|CPV|Aktenzeichen|Verfahren|Angebots|Publikation)|$)`, 'i'));
+      const match = text.match(new RegExp(`${label}\\s*:?\\s*(.{1,180}?)(?=\\s+(?:\u00d6ffentlich|CPV|Aktenzeichen|Verfahren|Angebots|Publikation|Leistungsort|Laufzeit|Zuschlags?|Öffnung|Bindefrist|Beschreibung|Auftragswert)|$)`, 'i'));
       if (match?.[1]) return match[1].trim();
     }
     return null;
@@ -222,22 +250,50 @@ export function parseDetailSummaryHtml(html, baseUrl = DASHBOARD_URL) {
     || text.match(/(?:Titel|Bezeichnung)\s*:?\s*(.*?)(?=\s+(?:Offenes|Nichtoffenes|Vergabestelle|CPV))/i)?.[1]?.trim()
     || null;
   const procedure = text.match(/(Offenes Verfahren|Nichtoffenes Verfahren|Verhandlungsverfahren|Öffentliche Ausschreibung|Interessenbekundung|Wettbewerb)/i)?.[1] || null;
-  return {
+  const parseGermanNumber = (value) => {
+    if (!value) return null;
+    const normalized = String(value).replace(/\s/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.').replace(/[^\d.-]/g, '');
+    const numberValue = Number(normalized);
+    return Number.isFinite(numberValue) ? numberValue : null;
+  };
+  const estimatedValueText = valueAfter(['Geschätzter Auftragswert', 'Geschätzter Wert', 'Auftragswert']);
+  const result = {
     portalProjectId: dialog.attr('data-button') || dialog.find('[data-button]').first().attr('data-button') || null,
     title,
     referenceNumber: number,
     contractingAuthority: valueAfter(['Auftraggeber', 'Vergabestelle']),
+    portalStatus: valueAfter(['Status']),
     procedureType: procedure,
     procurementRegulation: text.match(/\b(VOB|VGV|UVgO|SektVO)\b/i)?.[1]?.toUpperCase() || null,
     publicationDate: normalizeDate(valueAfter(['Publikation', 'Veröffentlichung'])),
     submissionDeadline: normalizeDate(valueAfter(['Angebotsfrist', 'Frist'])),
     questionDeadline: normalizeDate(valueAfter(['Frist für Fragen', 'Fragenfrist'])),
+    openingDate: normalizeDate(valueAfter(['Öffnungstermin', 'Öffnung der Angebote'])),
+    bindingPeriod: normalizeDate(valueAfter(['Bindefrist'])) || valueAfter(['Bindefrist']),
+    description: valueAfter(['Auftragsgegenstand', 'Kurzbeschreibung', 'Beschreibung']),
+    placeOfPerformance: valueAfter(['Leistungsort', 'Ort der Leistung', 'Erfüllungsort']),
+    contractDuration: valueAfter(['Laufzeit', 'Vertragslaufzeit']),
+    awardCriteria: valueAfter(['Zuschlagskriterien', 'Zuschlagskriterium']),
+    estimatedValueCents: estimatedValueText && parseGermanNumber(estimatedValueText) != null ? Math.round(parseGermanNumber(estimatedValueText) * 100) : null,
+    estimatedValueCurrency: /GBP|USD|CHF|EUR/i.exec(estimatedValueText || '')?.[0]?.toUpperCase() || 'EUR',
     cpvCodes: [...new Set(cpvCodes)],
     cpvLabels: cpvLabels.length ? cpvLabels : null,
     electronicSubmission: /elektronische Angebotsabgabe|elektronisch/i.test(text),
     rawText: text,
     sourceUrl: baseUrl,
   };
+  result.textSections = [makeTextSection({
+    sectionKey: 'summary', title: 'Verfahrenszusammenfassung', sourceUrl: baseUrl, text,
+  })];
+  result.facts = uniqueFacts([
+    ...extractFactsFromDom(dialog.length ? dialog : $, 'summary', baseUrl),
+    ...knownSummaryFacts(result, baseUrl),
+    ...result.cpvCodes.map((code, index) => makeFact({
+      sectionKey: 'summary', key: `summary:cpv:${code}`, label: `CPV ${code}`,
+      value: result.cpvLabels?.[index] || code, normalizedValue: code, dataType: 'cpv', sourceUrl: baseUrl,
+    })),
+  ].filter(Boolean));
+  return result;
 }
 
 async function extractSummaryFromDialog(page) {
@@ -248,7 +304,7 @@ async function extractSummaryFromDialog(page) {
     const text = (dialog.innerText || dialog.textContent || '').replace(/\s+/g, ' ').trim();
     const valueAfter = (labels) => {
       for (const label of labels) {
-        const match = text.match(new RegExp(`${label}\\s*:?\\s*(.{1,180}?)(?=\\s+(?:Öffentlich|CPV|Aktenzeichen|Verfahren|Angebots|Publikation)|$)`, 'i'));
+        const match = text.match(new RegExp(`${label}\\s*:?\\s*(.{1,180}?)(?=\\s+(?:Öffentlich|CPV|Aktenzeichen|Verfahren|Angebots|Publikation|Leistungsort|Laufzeit|Zuschlags?|Öffnung|Bindefrist|Beschreibung|Auftragswert)|$)`, 'i'));
         if (match?.[1]) return match[1].trim();
       }
       return null;
@@ -265,11 +321,19 @@ async function extractSummaryFromDialog(page) {
       title: heading?.textContent?.replace(/\s+/g, ' ').trim() || null,
       referenceNumber: text.match(/(?:Nr\.?|Verfahrensnummer)\s*[:#]?\s*([\w/-]+)/i)?.[1] || null,
       contractingAuthority: valueAfter(['Auftraggeber', 'Vergabestelle']),
+      portalStatus: valueAfter(['Status']),
       procedureType: text.match(/(Offenes Verfahren|Nichtoffenes Verfahren|Verhandlungsverfahren|Öffentliche Ausschreibung|Interessenbekundung|Wettbewerb)/i)?.[1] || null,
       procurementRegulation: text.match(/\b(VOB|VGV|UVgO|SektVO)\b/i)?.[1]?.toUpperCase() || null,
       publicationDate: valueAfter(['Publikation', 'Veröffentlichung']),
       submissionDeadline: valueAfter(['Angebotsfrist', 'Frist']),
       questionDeadline: valueAfter(['Frist für Fragen', 'Fragenfrist']),
+      openingDate: valueAfter(['Öffnungstermin', 'Öffnung der Angebote']),
+      bindingPeriod: valueAfter(['Bindefrist']),
+      description: valueAfter(['Auftragsgegenstand', 'Kurzbeschreibung', 'Beschreibung']),
+      placeOfPerformance: valueAfter(['Leistungsort', 'Ort der Leistung', 'Erfüllungsort']),
+      contractDuration: valueAfter(['Laufzeit', 'Vertragslaufzeit']),
+      awardCriteria: valueAfter(['Zuschlagskriterien', 'Zuschlagskriterium']),
+      estimatedValueText: valueAfter(['Geschätzter Auftragswert', 'Geschätzter Wert', 'Auftragswert']),
       cpvCodes: [...new Set(cpvCodes)],
       cpvLabels: cpvLabels.length ? cpvLabels : null,
       electronicSubmission: /elektronische Angebotsabgabe|elektronisch/i.test(text),
@@ -281,7 +345,7 @@ async function extractSummaryFromDialog(page) {
 async function extractDocumentsFromDialog(page) {
   return page.evaluate(() => {
     const root = document.querySelector('#DIV_Dokumente, [data-url*="dxVUFilesForSupplier"], .documents, .Dokumente');
-    if (!root) return { documents: [], endpoint: null, html: '', loginRequired: false };
+    if (!root) return { documents: [], endpoint: null, html: '', text: '', loginRequired: false };
     const endpoint = root.getAttribute('data-url') || null;
     const rootText = root.innerText || '';
     const hasFileLink = [...root.querySelectorAll('a[href]')].some((link) =>
@@ -335,7 +399,7 @@ async function extractDocumentsFromDialog(page) {
         documents.push(document);
       }
     }
-    return { documents, endpoint, html: root.outerHTML, loginRequired };
+    return { documents, endpoint, html: root.outerHTML, text: rootText, loginRequired };
   });
 }
 
@@ -379,6 +443,25 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
       .some((d) => /Verfahren/i.test(d.textContent || '') && /CPV|Auftraggeber|Vergabestelle/i.test(d.textContent || '')), { timeout: 10000 }).catch(() => {});
     const summary = await extractSummaryFromDialog(page);
     if (!summary) return null;
+    summary.publicationDate = normalizeDate(summary.publicationDate) || summary.publicationDate;
+    summary.submissionDeadline = normalizeDate(summary.submissionDeadline) || summary.submissionDeadline;
+    summary.questionDeadline = normalizeDate(summary.questionDeadline) || summary.questionDeadline;
+    summary.openingDate = normalizeDate(summary.openingDate) || summary.openingDate;
+    summary.bindingPeriod = normalizeDate(summary.bindingPeriod) || summary.bindingPeriod;
+    summary.estimatedValueCents = parseGermanAmountCents(summary.estimatedValueText);
+    summary.estimatedValueCurrency = /GBP|USD|CHF|EUR/i.exec(summary.estimatedValueText || '')?.[0]?.toUpperCase() || 'EUR';
+    summary.textSections = [makeTextSection({
+      sectionKey: 'summary', title: 'Verfahrenszusammenfassung', sourceUrl: DASHBOARD_URL, text: summary.rawText,
+    })];
+    const summaryDom = summary.dialogHtml ? cheerio.load(summary.dialogHtml) : null;
+    summary.facts = uniqueFacts([
+      ...(summaryDom ? extractFactsFromDom(summaryDom, 'summary', DASHBOARD_URL) : []),
+      ...knownSummaryFacts(summary, DASHBOARD_URL),
+      ...(summary.cpvCodes || []).map((code, index) => makeFact({
+        sectionKey: 'summary', key: `summary:cpv:${code}`, label: `CPV ${code}`,
+        value: summary.cpvLabels?.[index] || code, normalizedValue: code, dataType: 'cpv', sourceUrl: DASHBOARD_URL,
+      })),
+    ].filter(Boolean));
     const detailBundle = {
       metadata: {
         portal: 'niedersachsen', portalProjectId, summary,
@@ -386,7 +469,7 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
       },
       crawlKind,
       fullCrawlSucceeded,
-      lots: [], criteria: [], documents: [], messages: [], snapshots: [
+      lots: [], criteria: [], documents: [], messages: [], textSections: summary.textSections, facts: summary.facts, snapshots: [
         { kind: 'ni:summary', sourceUrl: DASHBOARD_URL, content: summary.dialogHtml || summary.rawText, mimeType: 'text/html' },
       ],
       completeness: { overall: 'partial', sections: { summary: 'complete', announcement: 'empty', documents: 'empty', communication: 'not_offered' } },
@@ -398,20 +481,25 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
       return { iframeSrc: frame?.src || frame?.getAttribute('src') || null, html: frame?.outerHTML || '' };
     });
     let announcementUrl = announcement.iframeSrc;
+    let announcementText = '';
     for (const frame of page.frames()) {
       if (frame === page.mainFrame()) continue;
       try {
-        const linkHref = await frame.evaluate(() => {
+        const frameData = await frame.evaluate(() => {
           const links = [...document.querySelectorAll('a[href]')];
-          return links.find((a) => /DirectDocload|Bekanntmach|\.pdf(?:$|\?)/i.test(`${a.href} ${a.textContent || ''}`))?.href || null;
+          return {
+            linkHref: links.find((a) => /DirectDocload|Bekanntmach|\.pdf(?:$|\?)/i.test(`${a.href} ${a.textContent || ''}`))?.href || null,
+            text: document.body?.innerText || '',
+          };
         });
-        if (linkHref) { announcementUrl = linkHref; break; }
+        if (frameData.text && frameData.text.trim().length > announcementText.length) announcementText = frameData.text.trim();
+        if (frameData.linkHref) { announcementUrl = frameData.linkHref; break; }
       } catch { /* Cross-origin frame – src bleibt ein reproduzierbarer Locator. */ }
     }
-    if (announcementUrl && !/DirectDocload|Bekanntmach|\.pdf(?:$|\?)/i.test(announcementUrl)) announcementUrl = null;
+    const announcementIsFile = Boolean(announcementUrl && isDeferredDocumentRequest(announcementUrl));
     if (!announcementTabAvailable) {
       detailBundle.completeness.sections.announcement = 'unknown_structure';
-    } else if (announcementUrl) {
+    } else if (announcementIsFile) {
       detailBundle.documents.push({
         portalFileId: announcementUrl, filename: 'Bekanntmachung.pdf', category: 'announcement',
         mimeType: 'application/pdf', sourceUrl: DASHBOARD_URL,
@@ -421,7 +509,32 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
         kind: 'ni:announcement', sourceUrl: announcementUrl,
         content: announcement.html || announcementUrl, mimeType: 'text/html',
       });
+      detailBundle.textSections.push(makeTextSection({
+        sectionKey: 'announcement', title: 'Bekanntmachung', sourceUrl: announcementUrl,
+        text: cleanDetailText(announcement.html || ''), status: 'document_deferred',
+      }));
+      detailBundle.facts.push(makeFact({
+        sectionKey: 'announcement', key: 'announcement:locator', label: 'Bekanntmachung verfügbar',
+        value: 'Dokument inventarisiert; Inhalt wird erst bei Nutzeranforderung geladen',
+        normalizedValue: announcementUrl, dataType: 'document_locator', sourceUrl: DASHBOARD_URL,
+      }));
+      detailBundle.completeness.sections.announcement = 'document_deferred';
+    } else if (announcementText) {
+      detailBundle.snapshots.push({
+        kind: 'ni:announcement-html', sourceUrl: announcementUrl || DASHBOARD_URL,
+        content: announcementText, mimeType: 'text/html',
+      });
+      detailBundle.textSections.push(makeTextSection({
+        sectionKey: 'announcement', title: 'Bekanntmachung', sourceUrl: announcementUrl || DASHBOARD_URL,
+        text: announcementText, status: 'complete',
+      }));
       detailBundle.completeness.sections.announcement = 'complete';
+    } else if (announcementUrl) {
+      detailBundle.textSections.push(makeTextSection({
+        sectionKey: 'announcement', title: 'Bekanntmachung', sourceUrl: announcementUrl,
+        text: '', status: 'unknown_structure',
+      }));
+      detailBundle.completeness.sections.announcement = 'unknown_structure';
     } else detailBundle.completeness.sections.announcement = 'empty';
     const documentsTabAvailable = await clickDialogTab(page, 'Dokumente');
     await page.waitForTimeout(250);
@@ -434,6 +547,14 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
     detailBundle.documents.push(...docs.documents);
     detailBundle.metadata.documentsEndpoint = docs.endpoint;
     detailBundle.snapshots.push({ kind: 'ni:documents', sourceUrl: DASHBOARD_URL, content: docs.html, mimeType: 'text/html' });
+    detailBundle.textSections.push(makeTextSection({
+      sectionKey: 'documents', title: 'Dokumentinventar', sourceUrl: DASHBOARD_URL,
+      text: docs.text || '', status: !documentsTabAvailable ? 'unknown_structure' : (docs.loginRequired ? 'login_required' : 'complete'),
+    }));
+    detailBundle.facts.push(makeFact({
+      sectionKey: 'documents', key: 'documents:count', label: 'Dokumente inventarisiert',
+      value: String(docs.documents.length), normalizedValue: docs.documents.length, dataType: 'integer', sourceUrl: DASHBOARD_URL,
+    }));
     detailBundle.completeness.sections.documents = !documentsTabAvailable
       ? 'unknown_structure'
       : (docs.loginRequired
@@ -476,6 +597,15 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
       content: await page.evaluate(() => document.querySelector('[role="dialog"], .dx-dialog')?.outerHTML || ''),
       mimeType: 'text/html',
     });
+    const communicationText = await page.evaluate(() => document.querySelector('[role="dialog"], .dx-dialog')?.innerText || '');
+    detailBundle.textSections.push(makeTextSection({
+      sectionKey: 'communication', title: 'Kommunikation', sourceUrl: DASHBOARD_URL,
+      text: communicationText, status: communicationTabAvailable ? 'complete' : 'not_offered',
+    }));
+    detailBundle.facts.push(makeFact({
+      sectionKey: 'communication', key: 'communication:count', label: 'Nachrichten inventarisiert',
+      value: String(messages.length), normalizedValue: messages.length, dataType: 'integer', sourceUrl: DASHBOARD_URL,
+    }));
     const communicationLoginRequired = communicationTabAvailable && await page.evaluate(() => {
       const text = document.querySelector('[role="dialog"], .dx-dialog')?.innerText || '';
       return /(?:anmelden|login|registriert)/i.test(text) && !/(?:Bieterfrage|Nachricht|Mitteilung|Antwort)/i.test(text);
@@ -484,8 +614,11 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
     detailBundle.completeness.sections.communication = communicationLoginRequired
       ? 'login_required'
       : (messages.length ? 'complete' : (communicationTabAvailable ? 'empty' : 'not_offered'));
+    detailBundle.facts = uniqueFacts(detailBundle.facts);
+    detailBundle.textSections = detailBundle.textSections.filter((section, index, all) =>
+      all.findIndex((candidate) => candidate.sectionKey === section.sectionKey) === index);
     detailBundle.completeness.overall = Object.values(detailBundle.completeness.sections)
-      .some((value) => String(value).startsWith('temporary') || value === 'login_required' || value === 'unknown_structure') ? 'partial' : 'complete';
+      .some((value) => String(value).startsWith('temporary') || ['login_required', 'unknown_structure', 'document_deferred'].includes(value)) ? 'partial' : 'complete';
     // Ein Vollcrawl darf Sichtbarkeiten nur dann fortschreiben, wenn alle
     // angebotenen Bereiche erfolgreich verarbeitet wurden. Login- und
     // Strukturfehler dürfen vorhandene Dokumente nicht als verschwunden
@@ -498,11 +631,13 @@ async function openAndExtractDetail(page, liveRow, portalProjectId, { crawlKind 
       submissionDeadline: normalizeDate(summary.submissionDeadline) || summary.submissionDeadline,
       questionDeadline: normalizeDate(summary.questionDeadline) || summary.questionDeadline,
       tenderType: summary.procurementRegulation,
-      documentUrl: announcementUrl || null,
+      documentUrl: announcementIsFile ? announcementUrl : null,
       detailStatus: detailBundle.completeness.overall,
       fullCrawlSucceeded: detailBundle.fullCrawlSucceeded,
       detailCompleteness: detailBundle.completeness,
       portalMetadata: detailBundle.metadata,
+      textSections: detailBundle.textSections,
+      facts: detailBundle.facts,
       detailBundle,
     };
   } finally {
@@ -587,7 +722,8 @@ async function getNextPageNumber(page, currentPage) {
  */
 export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
   const checkpoint = getCheckpoint('niedersachsen');
-  const mode = checkpoint.backfill_complete ? 'incremental' : 'backfill';
+  const detailBackfill = job?.mode === 'detail_backfill';
+  const mode = detailBackfill ? 'backfill' : (checkpoint.backfill_complete ? 'incremental' : 'backfill');
   const log = startCrawlLog('niedersachsen');
   const stats = {
     pagesDone: 0,
@@ -621,6 +757,13 @@ export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
   });
 
   try {
+    await context.route('**/*', async (route) => {
+      if (isDeferredDocumentRequest(route.request().url())) {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      await route.continue();
+    });
     const page = await context.newPage();
     page.setDefaultTimeout(45000);
 
@@ -679,7 +822,8 @@ export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
         const cacheTimestamp = cache?.last_detail_at ? Date.parse(cache.last_detail_at) : NaN;
         const cacheAge = Number.isFinite(cacheTimestamp) ? Date.now() - cacheTimestamp : Infinity;
         const fingerprintChanged = Boolean(cache && cache.discovery_fingerprint !== tender.discoveryFingerprint);
-        const needsDetail = !cache
+        const needsDetail = detailBackfill
+          || !cache
           || fingerprintChanged
           || (cache.in_scope
             ? (!cache.detail_status || !existing || detailDue(existing))
@@ -689,7 +833,7 @@ export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
           if (liveRow) {
             detail = await openAndExtractDetail(page, liveRow, tender.portalProjectId, {
               crawlKind: mode === 'backfill' ? 'full' : 'incremental',
-              fullCrawlSucceeded: mode === 'backfill',
+              fullCrawlSucceeded: true,
             });
             if (detail) {
               stats.detailPagesSuccess += 1;
@@ -706,11 +850,20 @@ export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
               if (isSpecificProjectTitle(detail.title)) tender.title = detail.title;
               tender.referenceNumber = detail.referenceNumber || tender.referenceNumber;
               tender.contractingAuthority = detail.contractingAuthority || tender.contractingAuthority;
+              tender.portalStatus = detail.portalStatus || tender.portalStatus;
               tender.procedureType = detail.procedureType || tender.procedureType;
               tender.tenderType = detail.procurementRegulation || tender.tenderType;
               tender.publicationDate = detail.publicationDate || tender.publicationDate;
               tender.submissionDeadline = detail.submissionDeadline || tender.submissionDeadline;
+              tender.bindingPeriod = detail.bindingPeriod || tender.bindingPeriod;
               tender.questionDeadline = detail.questionDeadline || null;
+              tender.openingDate = detail.openingDate || tender.openingDate;
+              tender.contractDuration = detail.contractDuration || tender.contractDuration;
+              tender.description = detail.description || tender.description;
+              tender.placeOfPerformance = detail.placeOfPerformance || tender.placeOfPerformance;
+              tender.awardCriteria = detail.awardCriteria || tender.awardCriteria;
+              tender.estimatedValueCents = detail.estimatedValueCents ?? tender.estimatedValueCents;
+              tender.estimatedValueCurrency = detail.estimatedValueCurrency || tender.estimatedValueCurrency;
               tender.cpvCodes = detail.cpvCodes?.length ? detail.cpvCodes : tender.cpvCodes;
               tender.cpvLabels = detail.cpvLabels?.length ? detail.cpvLabels : tender.cpvLabels;
               tender.documentUrl = detail.documentUrl || tender.documentUrl;
@@ -757,7 +910,8 @@ export async function runNiedersachsenJob({ job, onProgress = () => {} } = {}) {
       stats.pagesDone += 1;
       stats.knownStreak = pageAllKnown ? stats.knownStreak + 1 : 0;
 
-      backfillDone = mode === 'backfill' && Boolean(stats.oldestPublicationDate) && stats.oldestPublicationDate < cutoffIso;
+      backfillDone = !detailBackfill && mode === 'backfill'
+        && Boolean(stats.oldestPublicationDate) && stats.oldestPublicationDate < cutoffIso;
       incrementalDone = mode === 'incremental' && stats.knownStreak >= config.evergabeKnownPageStop;
 
       updateCheckpoint('niedersachsen', {

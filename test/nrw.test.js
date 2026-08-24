@@ -145,6 +145,16 @@ test('NRW-eForms wertet Ja/Nein-Felder und unbekannte Geldwerte korrekt aus', ()
   assert.equal(parsed.submissionDeadline, '2026-12-31');
 });
 
+test('NRW-eForms liefert Klartextabschnitt und generische Fakten', () => {
+  const parsed = nrw.parseEformsPage(`<html><body>
+    <dl><dt>Verfahrensart</dt><dd>Offenes Verfahren</dd><dt>Sprache</dt><dd>Deutsch</dd></dl>
+    <p>Rahmenvereinbarung: Nein</p><p>Frist für den Eingang der Angebote 31.12.2026</p>
+  </body></html>`, `${BASE_URL}/processdata/eforms`);
+  assert.ok(parsed.textSections.some((section) => section.sectionKey === 'eforms' && /Verfahrensart/.test(section.text)));
+  assert.ok(parsed.facts.some((fact) => fact.label === 'procedureType'));
+  assert.ok(parsed.facts.some((fact) => fact.label === 'flags.frameworkAgreement'));
+});
+
 test('NRW-Dokumente und Kommunikation behalten Locator, Anhänge und Rohsnapshot', () => {
   const documents = nrw.parseDocumentsPage(`<html><body>
     <h2>Vergabeunterlagen</h2>
@@ -164,4 +174,33 @@ test('NRW-Dokumente und Kommunikation behalten Locator, Anhänge und Rohsnapshot
   assert.equal(communication.messages[0].attachments.length, 1);
   assert.equal(communication.messages[0].attachments[0].accessStatus, 'public');
   assert.equal(communication.snapshot.kind, 'nrw:communication');
+});
+
+test('NRW erlaubt Unterlagen-HTML, blockiert Download- und Binärantworten vor Parserverarbeitung', async () => {
+  assert.equal(nrw.isDeferredDocumentUrl(`${BASE_URL}/documents/project-1`), false);
+  assert.equal(nrw.isDeferredDocumentUrl(`${BASE_URL}/download/file?id=1`), true);
+  assert.equal(nrw.isDeferredDocumentUrl(`${BASE_URL}/file.pdf`), true);
+  httpClient.get = async () => ({
+    data: Buffer.from('%PDF-1.7'), status: 200,
+    headers: { 'content-type': 'application/pdf' }, config: { url: `${BASE_URL}/documents/project-1` },
+  });
+  assert.equal(await nrw.fetchDetail(`${BASE_URL}/documents/project-1`), null);
+});
+
+test('NRW lädt bekannte Download- und Binär-Redirect-Ziele nicht per GET', async () => {
+  const calls = [];
+  httpClient.get = async (url) => {
+    calls.push(url);
+    return { status: 302, headers: { location: `${BASE_URL}/files/bekanntmachung.pdf` }, data: '' };
+  };
+  assert.equal(await nrw.fetchDetail(`${BASE_URL}/download?id=1`), null);
+  assert.deepEqual(calls, []);
+  assert.equal(await nrw.fetchDetail(`${BASE_URL}/public/project`), null);
+  assert.deepEqual(calls, [`${BASE_URL}/public/project`]);
+});
+
+test('NRW materialisiert unbekannte Fließtextfelder nicht als Fakten', () => {
+  const parsed = nrw.parseEformsPage('<html><body><p>Unbekanntes Feld: geraten</p><dl><dt>Verfahrensart</dt><dd>Offenes Verfahren</dd></dl></body></html>', BASE_URL);
+  assert.equal(parsed.facts.some((fact) => fact.label === 'Unbekanntes Feld'), false);
+  assert.equal(parsed.facts.some((fact) => fact.label === 'procedureType'), true);
 });

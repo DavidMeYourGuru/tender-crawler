@@ -9,6 +9,7 @@ import * as cheerio from 'cheerio';
 import { getWithRedirects, httpClient } from '../crawler/http-client.js';
 import { contentHash, normalizeDate, deriveStatus, sleep } from '../utils.js';
 import config from '../config.js';
+import { cleanDetailText, extractFactsFromDom, makeFact, makeTextSection, uniqueFacts } from '../detail-data.js';
 
 export const meta = {
   id: 'nrw',
@@ -66,6 +67,40 @@ const PAGE_PARAMETER = 'selectedTablePagePROJECT_RESULT';
 const PAGE_SUMMARY_RE = /Seite:\s*(\d+)\s+von\s+(\d+)\s*-\s*Gesamteinträge:\s*(\d+)/i;
 const PROJECT_PATH_RE = /\/public\/company\/projectForwarding\.do$/i;
 const CPV_RE = /\b(\d{8}-\d)\b/g;
+
+/**
+ * Vergabeunterlagen-/Dokumente-Seiten sind HTML und dürfen gelesen werden.
+ * Gesperrt werden nur echte Dateiendungen bzw. bekannte Download-Endpunkte.
+ * Das ist absichtlich enger als ein bloßes `vergabeunterlage`-Substring:
+ * `/documents` und `/vergabeunterlagen` liefern auf NRW häufig erst das
+ * öffentliche HTML-Inventar.
+ */
+export function isDeferredDocumentUrl(url) {
+  const value = String(url || '');
+  if (!value) return false;
+  if (/\.(?:pdf|docx?|xlsx?|zip|7z|rar|odt|ods|txt|rtf)(?:$|[?#])/i.test(value)) return true;
+  return /(?:^|[/?_.?&-])(?:directdocload|download(?:document|file)?|filedownload)(?:[/?_.?&=-]|$)/i.test(value)
+    || /(?:[?&](?:download|downloadFile|fileDownload|inlineFile)(?:=true)?(?:&|$))/i.test(value);
+}
+
+function responseUrl(response, fallback) {
+  return response?.request?.res?.responseUrl || response?.config?.url || fallback;
+}
+
+function assertHtmlResponse(response, requestedUrl) {
+  const finalUrl = responseUrl(response, requestedUrl);
+  const contentType = String(response?.headers?.['content-type'] || '').toLowerCase();
+  const disposition = String(response?.headers?.['content-disposition'] || '').toLowerCase();
+  if (isDeferredDocumentUrl(finalUrl) || isDeferredDocumentUrl(requestedUrl)
+    || /(?:application\/(?:pdf|zip|msword|vnd\.|octet-stream)|image\/|audio\/|video\/)/i.test(contentType)
+    || /attachment\s*;/i.test(disposition)) {
+    throw new Error('document_deferred');
+  }
+  // A mocked/old adapter may omit content-type. Do not reject it solely for
+  // that reason; HTML is validated by the parser and all known binary types
+  // above are rejected before any body conversion.
+  return finalUrl;
+}
 
 // 45000000-7 (Bauarbeiten) bleibt als spätere Option erhalten, ist aber
 // wegen der großen Trefferzahl zunächst nicht aktiv.
@@ -225,12 +260,16 @@ export function parsePagination(html, currentUrl, cpvCode) {
 }
 
 async function fetchPage(url, rateLimiter, requestDelayMs) {
+  if (isDeferredDocumentUrl(url)) throw new Error('document_deferred');
   await rateLimiter?.acquire();
-  const response = await httpClient.get(url, { maxRedirects: 5 });
+  // Manuelle Redirects erlauben, jeden Hop und das finale Content-Type zu
+  // prüfen, bevor er als HTML in den Parser gelangt.
+  const response = await getWithRedirects(url, { rejectBinary: true }, 5);
+  const finalUrl = assertHtmlResponse(response, url);
   if (requestDelayMs > 0) await sleep(requestDelayMs);
   return {
     html: String(response.data),
-    url: response.request?.res?.responseUrl || response.config?.url || url,
+    url: finalUrl,
   };
 }
 
@@ -425,6 +464,12 @@ export function parseDetailPage(html, baseUrl = meta.baseUrl) {
     cpvCodes,
     cpvLabels,
     documentUrl: extractDocumentUrl($, baseUrl),
+    textSections: [makeTextSection({
+      sectionKey: 'overview',
+      title: 'Übersicht',
+      sourceUrl: baseUrl,
+      text: cleanDetailText(bodyLines($).join('\n')),
+    })],
   };
 }
 
@@ -448,7 +493,7 @@ function parseSizeBytes(value) {
 }
 
 function bodyLines($) {
-  const blockSelector = 'h1,h2,h3,h4,h5,h6,p,li,td,th,label,legend,button,article,section';
+  const blockSelector = 'h1,h2,h3,h4,h5,h6,p,li,td,th,dt,dd,label,legend,button,article,section';
   const blockTexts = $(blockSelector).filter((_, element) => !$(element).find(blockSelector).length)
     .map((_, element) => cleanText($(element).text())).get().filter(Boolean);
   if (blockTexts.length) return blockTexts;
@@ -476,6 +521,55 @@ function extractBooleanField(text, labels) {
     return !/^(?:nein|no|nicht zugelassen|nicht vorgesehen)$/i.test(match[1]);
   }
   return null;
+}
+
+function explicitBooleanFacts($, sectionKey, sourceUrl, metadata) {
+  const labels = {
+    frameworkAgreement: ['Rahmenvereinbarung'],
+    dynamicPurchasingSystem: ['dynamisches Beschaffungssystem', 'DPS'],
+    electronicAuction: ['elektronische Auktion'],
+    variants: ['Nebenangebote', 'Varianten'],
+    electronicSubmission: ['elektronische Angebotsabgabe', 'elektronisch eingereicht'],
+    euFunded: ['EU-Finanzierung', 'Finanzierung durch die Europäische Union'],
+    smeRelevant: ['KMU', 'kleine und mittlere Unternehmen'],
+    sustainable: ['Nachhaltigkeitskriterium', 'nachhaltige Beschaffung'],
+  };
+  const facts = [];
+  $('p,li,td,dd,label,.control-label,.field-label').each((_, node) => {
+    const text = cleanText($(node).text());
+    for (const [key, names] of Object.entries(labels)) {
+      if (!names.some((name) => new RegExp(`^${name}\\s*:?\\s*(?:ja|nein|yes|no|zugelassen|nicht zugelassen|vorgesehen|nicht vorgesehen)$`, 'i').test(text))) continue;
+      const value = metadata.flags?.[key];
+      if (value == null) continue;
+      facts.push(makeFact({
+        sectionKey, key: `${sectionKey}:flags.${key}`, label: `flags.${key}`,
+        value: value ? 'Ja' : 'Nein', normalizedValue: value, dataType: 'boolean', sourceUrl,
+      }));
+    }
+  });
+  return facts.filter(Boolean);
+}
+
+function canonicalStructuredFacts($, sectionKey, sourceUrl, metadata) {
+  const aliases = {
+    status: ['status'], procedureType: ['verfahrensart'], procurementRegulation: ['vergabeordnung', 'rechtsgrundlage'],
+    contractingAuthority: ['auftraggeber', 'vergabestelle'], buyerId: ['identifikationsnummer', 'ted-nummer', 'nuts'],
+    questionDeadline: ['frist für fragen', 'fragenfrist'], submissionDeadline: ['frist für den eingang der angebote', 'angebotsfrist', 'teilnahmefrist'],
+    openingDate: ['öffnungstermin', 'öffnung der angebote'], bindingPeriod: ['bindefrist'], publicationDate: ['veröffentlichungsdatum', 'datum der veröffentlichung'],
+    estimatedValue: ['geschätzter auftragswert', 'geschätzter wert', 'auftragswert'], contractDuration: ['laufzeit', 'vertragslaufzeit'],
+    placeOfPerformance: ['leistungsort', 'ort der leistung', 'erfüllungsort'],
+  };
+  const structured = extractFactsFromDom($, sectionKey, sourceUrl);
+  const facts = [];
+  for (const [key, names] of Object.entries(aliases)) {
+    const match = structured.find((fact) => names.some((name) => cleanText(fact.label).toLowerCase() === name));
+    if (!match) continue;
+    facts.push(makeFact({
+      sectionKey, key: `${sectionKey}:${key}`, label: key, value: match.valueText,
+      normalizedValue: match.valueText, dataType: 'structured', sourceUrl,
+    }));
+  }
+  return facts.filter(Boolean);
 }
 
 function parseCriteriaFromText(text) {
@@ -575,6 +669,7 @@ export function parseEformsPage(html, baseUrl = meta.baseUrl) {
     cpvCodes: cpv.cpvCodes,
     cpvLabels: cpv.cpvLabels,
     submissionDeadline: metadata.submissionDeadline ? normalizeDate(metadata.submissionDeadline) || metadata.submissionDeadline : null,
+    bindingPeriod: metadata.bindingPeriod ? normalizeDate(metadata.bindingPeriod) || metadata.bindingPeriod : null,
     openingDate: metadata.openingDate ? normalizeDate(metadata.openingDate) || metadata.openingDate : null,
     questionDeadline: metadata.questionDeadline ? normalizeDate(metadata.questionDeadline) || metadata.questionDeadline : null,
     contractDuration: durationText,
@@ -585,10 +680,37 @@ export function parseEformsPage(html, baseUrl = meta.baseUrl) {
     contractingAuthority: metadata.contractingAuthority,
     placeOfPerformance: metadata.placeOfPerformance,
     procedureType: metadata.procedureType,
+    portalStatus: metadata.status,
     tenderType: metadata.procurementRegulation,
     awardCriteria: criteria.filter((criterion) => criterion.kind === 'award').map((criterion) => criterion.description).join(' | ') || null,
   };
-  return { ...core, metadata, lots, criteria, snapshot: { kind: 'nrw:eforms', sourceUrl: baseUrl, content: String(html), mimeType: 'text/html' } };
+  return {
+    ...core,
+    metadata,
+    lots,
+    criteria,
+    facts: uniqueFacts([
+      ...extractFactsFromDom($, 'eforms', baseUrl),
+      ...canonicalStructuredFacts($, 'eforms', baseUrl, metadata),
+      ...explicitBooleanFacts($, 'eforms', baseUrl, metadata),
+      ...criteria.map((criterion) => makeFact({
+        sectionKey: 'eforms',
+        key: `eforms:criterion:${criterion.criterionKey}`,
+        label: criterion.title || criterion.kind,
+        value: criterion.description,
+        normalizedValue: criterion,
+        dataType: 'criterion',
+        sourceUrl: baseUrl,
+      })),
+    ].filter(Boolean)),
+    textSections: [makeTextSection({
+      sectionKey: 'eforms',
+      title: 'Verfahrensdaten / eForms',
+      sourceUrl: baseUrl,
+      text: lines.join('\n'),
+    })],
+    snapshot: { kind: 'nrw:eforms', sourceUrl: baseUrl, content: String(html), mimeType: 'text/html' },
+  };
 }
 
 export function parseDocumentsPage(html, baseUrl = meta.baseUrl) {
@@ -656,6 +778,13 @@ export function parseDocumentsPage(html, baseUrl = meta.baseUrl) {
     documents,
     archiveUrl: archiveLinks[0] || null,
     loginRequired,
+    textSection: makeTextSection({
+      sectionKey: 'documents',
+      title: 'Vergabeunterlagen',
+      sourceUrl: baseUrl,
+      text: cleanDetailText(bodyLines($).join('\n')),
+      status: loginRequired ? 'login_required' : 'complete',
+    }),
     snapshot: { kind: 'nrw:documents', sourceUrl: baseUrl, content: String(html), mimeType: 'text/html' },
   };
 }
@@ -709,7 +838,18 @@ export function parseCommunicationPage(html, baseUrl = meta.baseUrl) {
       subject, body, publishedAt: normalizeDate(publishedAt) || publishedAt, sourceUrl: baseUrl, attachments: [],
     });
   }
-  return { messages, loginRequired, snapshot: { kind: 'nrw:communication', sourceUrl: baseUrl, content: String(html), mimeType: 'text/html' } };
+  return {
+    messages,
+    loginRequired,
+    textSection: makeTextSection({
+      sectionKey: 'communication',
+      title: 'Kommunikation',
+      sourceUrl: baseUrl,
+      text: pageText,
+      status: loginRequired ? 'login_required' : 'complete',
+    }),
+    snapshot: { kind: 'nrw:communication', sourceUrl: baseUrl, content: String(html), mimeType: 'text/html' },
+  };
 }
 
 function absoluteLinks($, baseUrl) {
@@ -726,9 +866,10 @@ export async function fetchDetailBundle(url, {
   fullCrawlSucceeded = true,
 } = {}) {
   try {
+    if (isDeferredDocumentUrl(url)) return null;
     await rateLimiter?.acquire();
-    const response = await getWithRedirects(url, {}, 5);
-    const overviewUrl = response.config?.url || url;
+    const response = await getWithRedirects(url, { rejectBinary: true }, 5);
+    const overviewUrl = assertHtmlResponse(response, url);
     const overviewHtml = String(response.data);
     const overview = parseDetailPage(overviewHtml, overviewUrl);
     const $overview = cheerio.load(overviewHtml);
@@ -749,16 +890,19 @@ export async function fetchDetailBundle(url, {
     const bundle = {
       metadata: { portal: 'nrw', overviewUrl, cosinexProjectId }, crawlKind, fullCrawlSucceeded,
       lots: [], criteria: [], documents: [], messages: [], snapshots: [],
+      textSections: overview.textSections || [], facts: [],
       completeness: { overall: 'partial', sections: {} },
     };
     bundle.snapshots.push({ kind: 'nrw:overview', sourceUrl: overviewUrl, content: overviewHtml, mimeType: 'text/html' });
     bundle.completeness.sections.overview = 'complete';
     const pageFetch = async (sectionUrl) => {
       if (!sectionUrl) return null;
+      if (isDeferredDocumentUrl(sectionUrl)) throw new Error('document_deferred');
       await rateLimiter?.acquire();
-      const page = await getWithRedirects(sectionUrl, {}, 5);
+      const page = await getWithRedirects(sectionUrl, { rejectBinary: true }, 5);
+      const finalUrl = assertHtmlResponse(page, sectionUrl);
       if (requestDelayMs > 0) await sleep(requestDelayMs);
-      return { html: String(page.data), url: page.config?.url || sectionUrl };
+      return { html: String(page.data), url: finalUrl };
     };
     if (eformsUrl) {
       try {
@@ -768,6 +912,8 @@ export async function fetchDetailBundle(url, {
         bundle.metadata = { ...bundle.metadata, ...parsed.metadata };
         bundle.lots.push(...parsed.lots);
         bundle.criteria.push(...parsed.criteria);
+        bundle.textSections.push(...(parsed.textSections || []));
+        bundle.facts.push(...(parsed.facts || []));
         bundle.snapshots.push({ ...parsed.snapshot, sourceUrl: page.url });
         const recognized = parsed.cpvCodes?.length || parsed.criteria?.length || parsed.metadata.procedureType
           || parsed.metadata.contractingAuthority || parsed.metadata.submissionDeadline;
@@ -788,6 +934,11 @@ export async function fetchDetailBundle(url, {
           sourceUrl: page.url, locator: { href: parsed.archiveUrl, pageUrl: page.url }, accessStatus: 'public', downloadStatus: 'not_requested',
         });
         bundle.snapshots.push({ ...parsed.snapshot, sourceUrl: page.url });
+        if (parsed.textSection) bundle.textSections.push({ ...parsed.textSection, sourceUrl: page.url });
+        bundle.facts.push(makeFact({
+          sectionKey: 'documents', key: 'documents:count', label: 'Dokumente inventarisiert',
+          value: String(parsed.documents.length + (parsed.archiveUrl ? 1 : 0)), normalizedValue: parsed.documents.length + (parsed.archiveUrl ? 1 : 0), dataType: 'integer', sourceUrl: page.url,
+        }));
         bundle.completeness.sections.documents = parsed.loginRequired
           ? 'login_required'
           : (parsed.documents.length || parsed.archiveUrl ? 'complete' : 'empty');
@@ -819,6 +970,11 @@ export async function fetchDetailBundle(url, {
           }
         }
         bundle.snapshots.push({ ...parsed.snapshot, sourceUrl: page.url });
+        if (parsed.textSection) bundle.textSections.push({ ...parsed.textSection, sourceUrl: page.url });
+        bundle.facts.push(makeFact({
+          sectionKey: 'communication', key: 'communication:count', label: 'Nachrichten inventarisiert',
+          value: String(parsed.messages.length), normalizedValue: parsed.messages.length, dataType: 'integer', sourceUrl: page.url,
+        }));
         bundle.completeness.sections.communication = parsed.loginRequired
           ? 'login_required'
           : (parsed.messages.length ? 'complete' : 'empty');
@@ -828,8 +984,11 @@ export async function fetchDetailBundle(url, {
       }
     } else bundle.completeness.sections.communication = absentSectionStatus([/kommunikation|bieterfrage|nachricht/i]);
     const failed = Object.values(bundle.completeness.sections).some((value) =>
-      String(value).startsWith('temporary_error') || value === 'login_required' || value === 'unknown_structure');
+      String(value).startsWith('temporary_error') || ['login_required', 'unknown_structure', 'document_deferred'].includes(value));
     bundle.completeness.overall = failed ? 'partial' : 'complete';
+    bundle.facts = uniqueFacts(bundle.facts);
+    bundle.textSections = bundle.textSections.filter((section, index, all) =>
+      all.findIndex((candidate) => candidate.sectionKey === section.sectionKey) === index);
     bundle.fullCrawlSucceeded = Boolean(fullCrawlSucceeded && !failed);
     const portalProjectId = new URL(url, meta.baseUrl).searchParams.get('pid')
       || new URL(overviewUrl, meta.baseUrl).searchParams.get('pid')
@@ -843,6 +1002,8 @@ export async function fetchDetailBundle(url, {
       detailCrawledAt: new Date().toISOString(),
       detailCompleteness: bundle.completeness,
       portalMetadata: bundle.metadata,
+      textSections: bundle.textSections,
+      facts: bundle.facts,
       detailBundle: bundle,
     };
   } catch (error) {

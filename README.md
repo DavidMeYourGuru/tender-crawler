@@ -174,6 +174,12 @@ Alle Endpunkte außer `/api/health` erfordern den Header `Authorization: Bearer 
 | POST | `/api/discovered/:id/process` | Entdecktes Dokument verarbeiten (Funding/Tender) |
 | POST | `/api/rag/backfill` | RAG-Backfill (search_text_full + Chunks) |
 
+Tender-Details enthalten zusätzlich aktuelle `text_sections` (bereinigter Seitenklartext),
+generische `facts` sowie das Dokumentinventar. Dokumentdateien werden beim Crawl nicht
+geladen. Eine kontrollierte Nachanreicherung des Bestands startet mit
+`npm run backfill:details -- --sources=nrw,niedersachsen`; der Lauf erstellt vorher eine
+SQLite-Sicherung und benötigt für Niedersachsen den Browser-Worker.
+
 ## Verwaltete Quellen & RAG
 
 - **`crawl_sources`**: Katalog mit 66+ Förder-/Ausschreibungsquellen. Quellen werden erst nach einem erfolgreichen **Probe-Crawl** aktiviert; Status `unprobed`/`active`/`blocked`/`needs_config`/`disabled`.

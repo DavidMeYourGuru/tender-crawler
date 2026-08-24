@@ -125,7 +125,7 @@ export async function enqueueBrowserCrawlJobs({ sources: sourceIds = null } = {}
  * Adapter liefern dabei ein vollständiges Detail-Bundle; ältere Adapter
  * bleiben mit dem kleinen Detailvertrag kompatibel.
  */
-export async function enrichTenders(tenderIds, { force = false, crawlLogIds = null } = {}) {
+export async function enrichTenders(tenderIds, { force = false, crawlLogIds = null, report = null } = {}) {
   const portals = await loadPortalModules();
   let enriched = 0;
   const metricsBySource = new Map();
@@ -141,7 +141,10 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
     const tender = getTenderById(id);
     if (!tender) continue;
     const portalModule = portals.get(tender.source_id);
-    if (!portalModule?.fetchDetail && !portalModule?.fetchDetailBundle) continue;
+    if (!portalModule?.fetchDetail && !portalModule?.fetchDetailBundle) {
+      if (report) report.failed = (report.failed || 0) + 1;
+      continue;
+    }
 
     // Ein erfolgreich gespeicherter Vollcrawl ist idempotent. Alte Datensätze
     // ohne Detailstatus werden einmalig nachangereichert.
@@ -158,6 +161,7 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
       });
       if (!detail) {
         metricsFor(tender.source_id).detailPagesFailed += 1;
+        if (report) report.failed = (report.failed || 0) + 1;
         continue;
       }
       const detailMetrics = metricsFor(tender.source_id);
@@ -211,11 +215,13 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
         portalProjectId: detail.portalProjectId || tender.portal_project_id,
         publicationDate: detail.publicationDate || tender.publication_date,
         submissionDeadline: detail.submissionDeadline || tender.submission_deadline,
+        bindingPeriod: detail.bindingPeriod || tender.binding_period,
         questionDeadline: detail.questionDeadline || tender.question_deadline,
         openingDate: detail.openingDate || tender.opening_date,
         contractDuration: detail.contractDuration || tender.contract_duration,
         documentUrl,
         status: tender.status,
+        portalStatus: detail.portalStatus || detail.portalMetadata?.status || tender.portal_status,
         detailStatus: detail.detailStatus,
         detailCrawlKind: detail.crawlKind || detail.detailBundle?.crawlKind || 'full',
         fullCrawlSucceeded: detail.fullCrawlSucceeded ?? detail.detailBundle?.fullCrawlSucceeded ?? true,
@@ -236,9 +242,11 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
       enriched += 1;
     } catch (error) {
       metricsFor(tender.source_id).detailPagesFailed += 1;
+      if (report) report.failed = (report.failed || 0) + 1;
       console.error(`[enrich] Detail für Tender ${id} (${tender.title}) fehlgeschlagen:`, error.message);
     }
   }
+  if (report) report.metrics = Object.fromEntries([...metricsBySource.entries()]);
   for (const [sourceId, metrics] of metricsBySource) {
     const logId = crawlLogIds?.[sourceId];
     if (logId) updateCrawlDetailMetrics({ id: logId, ...metrics });

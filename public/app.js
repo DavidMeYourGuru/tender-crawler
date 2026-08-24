@@ -1,4 +1,5 @@
 /* global fetch */
+import { escapeHtml, safeHttpUrl } from './ui-security.js';
 'use strict';
 
 const TOKEN_KEY = 'tender_crawler_token';
@@ -196,12 +197,6 @@ const daysUntil = (isoDate) => {
   if (d.includes('T')) d = d.split('T')[0];
   return Math.ceil((new Date(`${d}T23:59:59`).getTime() - Date.now()) / 86400000);
 };
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text == null ? '' : String(text);
-  return div.innerHTML;
-}
 
 function linkKindLabel(kind) {
   return {
@@ -971,6 +966,40 @@ async function openDetail(id) {
         ? tender.cpv_codes.map((code) => `<span class="chip">CPV ${escapeHtml(code)}</span>`).join(' ')
         : '<p>–</p>';
 
+    const facts = Array.isArray(tender.facts) ? tender.facts : [];
+    const lots = Array.isArray(tender.lots) ? tender.lots : [];
+    const criteria = Array.isArray(tender.criteria) ? tender.criteria : [];
+    const messages = Array.isArray(tender.messages) ? tender.messages : [];
+    const textSections = Array.isArray(tender.text_sections) ? tender.text_sections : [];
+    const documents = Array.isArray(tender.documents) ? tender.documents : [];
+    const factGroups = new Map();
+    for (const fact of facts) {
+      const section = fact.section_key || 'Weitere Angaben';
+      if (!factGroups.has(section)) factGroups.set(section, []);
+      factGroups.get(section).push(fact);
+    }
+    const factsHtml = [...factGroups.entries()].map(([section, values]) => `
+      <div class="detail-subsection"><h4>${escapeHtml(section)}</h4>
+      <dl>${values.map((fact) => `<div><dt>${escapeHtml(fact.label || 'Angabe')}</dt><dd>${escapeHtml(fact.value_text || '–')}</dd></div>`).join('')}</dl></div>
+    `).join('');
+    const documentsHtml = documents.length ? `
+      <table class="detail-table"><thead><tr><th>Datei</th><th>Kategorie</th><th>Status</th><th>Quelle</th></tr></thead><tbody>
+      ${documents.map((doc) => {
+        const locator = doc.locator_json || doc.locator || {};
+        const pageUrl = safeHttpUrl(locator.pageUrl || locator.page_url || doc.source_url);
+        return `<tr><td>${escapeHtml(doc.filename || 'Dokument')}</td><td>${escapeHtml(doc.category || '–')}</td><td>${escapeHtml(doc.download_status || 'not_requested')}</td><td>${pageUrl ? `<a href="${escapeHtml(pageUrl)}" target="_blank" rel="noopener noreferrer">Portalseite ↗</a>` : '–'}</td></tr>`;
+      }).join('')}</tbody></table>` : '<p>Keine Dokumente inventarisiert.</p>';
+    const lotsHtml = lots.length ? `<table class="detail-table"><thead><tr><th>Los</th><th>Titel</th><th>Ort</th><th>Laufzeit</th><th>Wert</th></tr></thead><tbody>${lots.map((lot) => `<tr><td>${escapeHtml(lot.lot_number || lot.lot_key || '–')}</td><td>${escapeHtml(lot.title || lot.description || '–')}</td><td>${escapeHtml(lot.place_of_performance || '–')}</td><td>${escapeHtml(lot.contract_duration || '–')}</td><td>${escapeHtml(fmtCents(lot.estimated_value_cents, lot.estimated_value_currency))}</td></tr>`).join('')}</tbody></table>` : '<p>Keine Lose inventarisiert.</p>';
+    const criteriaHtml = criteria.length ? `<table class="detail-table"><thead><tr><th>Art</th><th>Kriterium</th><th>Gewichtung</th><th>Erforderlich</th></tr></thead><tbody>${criteria.map((criterion) => `<tr><td>${escapeHtml(criterion.kind || '–')}</td><td>${escapeHtml(criterion.title || criterion.description || '–')}<br><small>${escapeHtml(criterion.description || '')}</small></td><td>${criterion.weight == null ? '–' : `${escapeHtml(criterion.weight)} %`}</td><td>${criterion.required == null ? '–' : (criterion.required ? 'Ja' : 'Nein')}</td></tr>`).join('')}</tbody></table>` : '<p>Keine Kriterien inventarisiert.</p>';
+    const messagesHtml = messages.length ? `<div>${messages.map((message) => `<article class="detail-message"><h4>${escapeHtml(message.subject || 'Nachricht')}</h4><small>${escapeHtml(fmtDate(message.published_at))}</small><p>${linkify(message.body || '')}</p></article>`).join('')}</div>` : '<p>Keine Nachrichten inventarisiert.</p>';
+    const textSectionsHtml = textSections.map((section) => `
+      <details class="detail-text-section"><summary>${escapeHtml(section.title || section.section_key || 'Abschnitt')} · ${escapeHtml(section.status || 'complete')}</summary><pre>${escapeHtml(section.text || '')}</pre></details>
+    `).join('');
+    const completenessSections = tender.completeness_status?.sections || {};
+    const completenessHtml = Object.keys(completenessSections).length
+      ? `<dl>${Object.entries(completenessSections).map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>`
+      : '<p>Keine Abschnittsstatus verfügbar.</p>';
+
     const changes = (tender.changes || []).slice(0, 10)
       .map((c) => `<li><strong>${escapeHtml(c.field)}</strong>: ${escapeHtml(c.old_value ?? '–')} → ${escapeHtml(c.new_value ?? '–')}</li>`)
       .join('');
@@ -980,13 +1009,23 @@ async function openDetail(id) {
       <div class="detail-section">
         <h3>Allgemein</h3>
         <p><strong>Quelle:</strong> ${escapeHtml(tender.source_name || tender.source_id)}</p>
+        <p><strong>Externe ID:</strong> ${escapeHtml(tender.external_id || '–')}</p>
+        <p><strong>Portal-Projekt:</strong> ${escapeHtml(tender.portal_project_id || '–')}</p>
         <p><strong>Status:</strong> ${escapeHtml(statusLabel[tender.status] || tender.status)}</p>
+        <p><strong>Portalstatus:</strong> ${escapeHtml(tender.portal_status || '–')}</p>
+        <p><strong>Verfahrensnummer:</strong> ${escapeHtml(tender.reference_number || '–')}</p>
+        <p><strong>Verfahrensart:</strong> ${escapeHtml(tender.procedure_type || tender.tender_type || '–')}</p>
         <p><strong>Veröffentlichung:</strong> ${fmtDate(tender.publication_date)}</p>
         <p><strong>Frist:</strong> ${fmtDate(tender.submission_deadline)}</p>
+        <p><strong>Bindefrist:</strong> ${fmtDate(tender.binding_period)}</p>
+        <p><strong>Frist für Fragen:</strong> ${fmtDate(tender.question_deadline)}</p>
+        <p><strong>Öffnung:</strong> ${fmtDate(tender.opening_date)}</p>
+        <p><strong>Laufzeit:</strong> ${escapeHtml(tender.contract_duration || '–')}</p>
         <p><strong>Wert:</strong> ${escapeHtml(fmtCents(tender.estimated_value_cents, tender.estimated_value_currency))}</p>
         <p><strong>Auftraggeber:</strong> ${escapeHtml(tender.contracting_authority || '–')}</p>
         <p><strong>Leistungsort:</strong> ${escapeHtml(tender.place_of_performance || '–')}</p>
-        <p><a href="${escapeHtml(tender.url)}" target="_blank" rel="noopener noreferrer">Zur Ausschreibung ↗</a></p>
+        <p><strong>Zuschlagskriterien:</strong> ${escapeHtml(tender.award_criteria || '–')}</p>
+        ${safeHttpUrl(tender.url) ? `<p><a href="${escapeHtml(safeHttpUrl(tender.url))}" target="_blank" rel="noopener noreferrer">Zur Ausschreibung ↗</a></p>` : ''}
       </div>
       ${tender.description ? `
       <div class="detail-section">
@@ -997,6 +1036,36 @@ async function openDetail(id) {
       <div class="detail-section">
         <h3>CPV-Codes</h3>
         <p class="chip-group">${cpvLabels}</p>
+      </div>` : ''}
+      <div class="detail-section">
+        <h3>Lose</h3>
+        ${lotsHtml}
+      </div>
+      <div class="detail-section">
+        <h3>Kriterien</h3>
+        ${criteriaHtml}
+      </div>
+      <div class="detail-section">
+        <h3>Vollständigkeit</h3>
+        <p><strong>Gesamt:</strong> ${escapeHtml(tender.completeness_status?.overall || tender.detail_status || '–')}</p>
+        ${completenessHtml}
+      </div>
+      <div class="detail-section">
+        <h3>Zusatzangaben</h3>
+        ${factsHtml || '<p>–</p>'}
+      </div>
+      <div class="detail-section">
+        <h3>Dokumentinventar</h3>
+        ${documentsHtml}
+      </div>
+      <div class="detail-section">
+        <h3>Nachrichten</h3>
+        ${messagesHtml}
+      </div>
+      ${textSectionsHtml ? `
+      <div class="detail-section">
+        <h3>Gespeicherte Seiteninhalte</h3>
+        ${textSectionsHtml}
       </div>` : ''}
       ${tender.llm_summary ? `
       <div class="detail-section">

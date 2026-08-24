@@ -41,6 +41,7 @@ test('Niedersachsen-Dialogparser übernimmt UUID-nahe Verfahrensdaten, CPVs und 
       <p>Nr. 587136 · Offenes Verfahren · VGV</p>
       <p>Vergabestelle: Stadt Beispiel</p>
       <p>Publikation: 03.08.2026 Angebotsfrist: 03.09.2026</p>
+      <p>Leistungsort: Bremervörde Laufzeit: 12 Monate</p>
       <p>CPV-Klassifizierung 45000000-7 Bauarbeiten 77300000-3 Gartenbau</p>
       <p>Elektronische Angebotsabgabe</p>
     </div>`);
@@ -48,6 +49,10 @@ test('Niedersachsen-Dialogparser übernimmt UUID-nahe Verfahrensdaten, CPVs und 
   assert.equal(detail.procurementRegulation, 'VGV');
   assert.deepEqual(detail.cpvCodes, ['45000000-7', '77300000-3']);
   assert.equal(detail.electronicSubmission, true);
+  assert.equal(detail.placeOfPerformance, 'Bremervörde');
+  assert.equal(detail.contractDuration, '12 Monate');
+  assert.ok(detail.textSections.some((section) => section.sectionKey === 'summary'));
+  assert.ok(detail.facts.some((fact) => fact.label === 'contractDuration'));
 });
 
 test('Niedersachsen verwendet UUID und Discovery-Fingerprint statt Frist-Hash', () => {

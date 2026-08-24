@@ -181,6 +181,29 @@ test('Detail-Bundle wird versioniert und durch dünnen Listentreffer nicht verk�
   assert.equal(detail.snapshots.length, 1);
 });
 
+test('Detail-Bundle speichert aktuelle Textabschnitte und generische Fakten', () => {
+  const tender = makeTender({
+    sourceId: 'nrw', externalId: 'text-facts-001', portalProjectId: 'text-facts-001',
+    detailStatus: 'complete', fullCrawlSucceeded: true,
+    detailBundle: {
+      fullCrawlSucceeded: true,
+      completeness: { overall: 'complete', sections: { overview: 'complete' } },
+      textSections: [{ sectionKey: 'overview', title: 'Übersicht', text: 'Unstrukturierter Projektvolltext.' }],
+      facts: [{ factKey: 'overview:language', sectionKey: 'overview', label: 'Sprache', valueText: 'Deutsch', normalizedValue: 'de' }],
+    },
+  });
+  const first = saveTender(tender);
+  let detail = getTenderBundleById(first.tenderId);
+  assert.equal(detail.textSections[0].text, 'Unstrukturierter Projektvolltext.');
+  assert.equal(detail.facts[0].value_text, 'Deutsch');
+  saveTender({ ...tender, detailBundle: {
+    ...tender.detailBundle, textSections: [{ sectionKey: 'overview', title: 'Übersicht', text: 'Neue Fassung.' }], facts: [],
+  } });
+  detail = getTenderBundleById(first.tenderId);
+  assert.equal(detail.textSections[0].text, 'Neue Fassung.');
+  assert.equal(detail.facts.length, 0);
+});
+
 test('Detail-Bundle wird atomar gespeichert und fehlerhafte Bundles hinterlassen keinen Kerndatensatz', () => {
   const circular = {};
   circular.self = circular;
@@ -214,4 +237,39 @@ test('Dokumente durchlaufen bei erfolgreichen Vollcrawls not_seen und removed', 
   assert.equal(getTenderBundleById(first.tenderId).documents[0].visibility_status, 'not_seen');
   saveTender(emptyBundle);
   assert.equal(getTenderBundleById(first.tenderId).documents[0].visibility_status, 'removed');
+});
+
+test('Bindefrist und Portalstatus werden als Kernfelder persistiert und durchsuchbar', () => {
+  const tender = makeTender({
+    sourceId: 'nrw', externalId: 'normalized-fields-001', portalProjectId: 'normalized-fields-001',
+    bindingPeriod: '2026-10-15', portalStatus: 'Veröffentlicht', contentHash: 'normalized-fields-001',
+    detailBundle: {
+      fullCrawlSucceeded: true,
+      completeness: { overall: 'complete', sections: { overview: 'complete' } },
+      textSections: [{ sectionKey: 'overview', text: 'Extrem seltenes Suchwort für FTS.' }],
+    },
+  });
+  const result = saveTender(tender);
+  const stored = getTenderById(result.tenderId);
+  assert.equal(stored.binding_period, '2026-10-15');
+  assert.equal(stored.portal_status, 'Veröffentlicht');
+  assert.equal(listTenders({ q: 'Suchwort' }).total >= 1, true);
+});
+
+test('Obsolete Snapshots werden nur nach erfolgreichem Vollcrawl entfernt', () => {
+  const tender = makeTender({ sourceId: 'nrw', externalId: 'snapshot-preserve-001', portalProjectId: 'snapshot-preserve-001', contentHash: 'snapshot-preserve-001' });
+  const first = saveTender({ ...tender, detailBundle: {
+    fullCrawlSucceeded: true, completeness: { overall: 'complete' },
+    snapshots: [{ kind: 'overview', content: 'alt' }, { kind: 'documents', content: 'docs' }],
+  } });
+  saveTender({ ...tender, detailBundle: {
+    fullCrawlSucceeded: false, completeness: { overall: 'partial' },
+    snapshots: [{ kind: 'overview', content: 'neu' }],
+  } });
+  assert.deepEqual(getTenderBundleById(first.tenderId).snapshots.map((snapshot) => snapshot.kind).sort(), ['documents', 'overview']);
+  saveTender({ ...tender, detailBundle: {
+    fullCrawlSucceeded: true, completeness: { overall: 'complete' },
+    snapshots: [{ kind: 'overview', content: 'final' }],
+  } });
+  assert.deepEqual(getTenderBundleById(first.tenderId).snapshots.map((snapshot) => snapshot.kind), ['overview']);
 });

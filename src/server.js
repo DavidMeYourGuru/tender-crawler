@@ -174,7 +174,10 @@ app.get('/api/tenders', { preHandler: requireAuth }, async (request) => {
     page: Number(query.page) || 1,
     limit: Number(query.limit) || 25,
   });
-  return result;
+  const safeUrl = (value) => /^https?:\/\//i.test(String(value || '')) ? String(value) : null;
+  return { ...result, tenders: result.tenders.map((tender) => ({
+    ...tender, url: safeUrl(tender.url), document_url: safeUrl(tender.document_url),
+  })) };
 });
 
 /**
@@ -192,20 +195,42 @@ app.get('/api/tenders/:id', { preHandler: requireAuth }, async (request, reply) 
     if (!value) return null;
     try { return JSON.parse(value); } catch { return value; }
   };
+  const safeUrl = (value) => /^https?:\/\//i.test(String(value || '')) ? String(value) : null;
+  const sanitizeLocator = (locator) => {
+    if (!locator || typeof locator !== 'object') return locator;
+    return Object.fromEntries(Object.entries(locator).map(([key, value]) =>
+      /(?:url|href|endpoint|src)$/i.test(key) ? [key, safeUrl(value)] : [key, value]));
+  };
+  const safeBundle = detailBundle ? {
+    ...detailBundle,
+    documents: (detailBundle.documents || []).map((doc) => ({
+      ...doc, source_url: safeUrl(doc.source_url), locator: sanitizeLocator(doc.locator), locator_json: sanitizeLocator(doc.locator_json),
+    })),
+    messages: (detailBundle.messages || []).map((message) => ({
+      ...message, source_url: safeUrl(message.source_url),
+    })),
+    snapshots: (detailBundle.snapshots || []).map((snapshot) => ({ ...snapshot, source_url: safeUrl(snapshot.source_url) })),
+    textSections: (detailBundle.textSections || []).map((section) => ({ ...section, source_url: safeUrl(section.source_url) })),
+    facts: (detailBundle.facts || []).map((fact) => ({ ...fact, source_url: safeUrl(fact.source_url) })),
+  } : null;
   return {
     ...tender,
+    url: safeUrl(tender.url),
+    document_url: safeUrl(tender.document_url),
     cpv_codes: tender.cpv_codes ? JSON.parse(tender.cpv_codes) : null,
     cpv_labels: tender.cpv_labels ? JSON.parse(tender.cpv_labels) : null,
     llm_requirements: tender.llm_requirements ? JSON.parse(tender.llm_requirements) : null,
     portal_metadata: parseJson(tender.portal_metadata_json),
     detail_completeness: parseJson(tender.detail_completeness),
-    detail_bundle: detailBundle,
-    lots: detailBundle?.lots || [],
-    criteria: detailBundle?.criteria || [],
-    documents: detailBundle?.documents || [],
-    messages: detailBundle?.messages || [],
-    snapshots: detailBundle?.snapshots || [],
-    completeness_status: detailBundle?.completeness || parseJson(tender.detail_completeness),
+    detail_bundle: safeBundle,
+    lots: safeBundle?.lots || [],
+    criteria: safeBundle?.criteria || [],
+    documents: safeBundle?.documents || [],
+    messages: safeBundle?.messages || [],
+    snapshots: safeBundle?.snapshots || [],
+    text_sections: safeBundle?.textSections || [],
+    facts: safeBundle?.facts || [],
+    completeness_status: safeBundle?.completeness || parseJson(tender.detail_completeness),
     changes,
   };
 });

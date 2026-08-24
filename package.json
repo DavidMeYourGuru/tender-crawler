@@ -9,6 +9,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "crawl": "node src/cli-crawl.js",
+    "backfill:details": "node src/cli-backfill-details.js",
     "worker": "node src/worker.js",
     "worker:dev": "node --watch src/worker.js",
     "funding": "node src/cli-fetch-funding.js",

@@ -27,7 +27,7 @@ export const httpClient = axios.create({
  * - ISO-8859-1 / latin1 / windows-1252 → latin1 (1:1 Byte-Mapping,
  *   für deutsche Umlaute identisch)
  */
-function decodeBody(data, contentType = '') {
+export function decodeBody(data, contentType = '') {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const ct = contentType.toLowerCase();
   const charsetMatch = ct.match(/charset=([^;]+)/);
@@ -42,6 +42,13 @@ function decodeBody(data, contentType = '') {
 // bleibt als Buffer unangetastet).
 const TEXT_CONTENT_RE = /^(text\/|application\/(json|xml|xhtml\+xml|javascript|ld\+json|atom\+xml|rss\+xml))/i;
 const JSON_CONTENT_RE = /application\/(json|ld\+json)/i;
+const BINARY_CONTENT_RE = /(?:application\/(?:pdf|zip|msword|vnd\.|octet-stream)|image\/|audio\/|video\/)/i;
+
+function isBinaryUrl(url) {
+  return /\.(?:pdf|docx?|xlsx?|zip|7z|rar|odt|ods|txt|rtf)(?:$|[?#])/i.test(String(url || ''))
+    || /(?:^|[/?_.?&-])(?:directdocload|download(?:document|file)?|filedownload)(?:[/?_.?&=-]|$)/i.test(String(url || ''))
+    || /(?:[?&](?:download|downloadFile|fileDownload|inlineFile)(?:=true)?(?:&|$))/i.test(String(url || ''));
+}
 
 // Einfacher Cookie-Jar: Hostname -> Map(name -> value)
 const cookieJar = new Map();
@@ -132,15 +139,32 @@ export async function fetchHtml(url, { referer = null } = {}) {
  * Zwischenschritt übernommen (für Portale mit Session-Cookie-Setup).
  */
 export async function getWithRedirects(url, options = {}, maxRedirects = 5) {
+  const { rejectBinary = false, ...requestOptions } = options || {};
+  const streamMode = rejectBinary && requestOptions.responseType == null;
   let currentUrl = url;
   for (let i = 0; i <= maxRedirects; i += 1) {
+    if (rejectBinary && isBinaryUrl(currentUrl)) throw new Error('document_deferred');
     // Redirects manuell folgen, damit Set-Cookie aus 3xx-Antworten übernommen wird
-    const response = await httpClient.get(currentUrl, { ...options, maxRedirects: 0 });
+    const response = await httpClient.get(currentUrl, {
+      ...requestOptions, ...(streamMode ? { responseType: 'stream' } : {}), maxRedirects: 0,
+    });
     storeCookies(response);
     const location = response.headers?.location;
     if (response.status >= 300 && response.status < 400 && location) {
+      response.data?.destroy?.();
       currentUrl = new URL(location, currentUrl).toString();
       continue;
+    }
+    if (rejectBinary && (isBinaryUrl(currentUrl)
+      || BINARY_CONTENT_RE.test(String(response.headers?.['content-type'] || ''))
+      || /attachment\s*;/i.test(String(response.headers?.['content-disposition'] || '')))) {
+      response.data?.destroy?.();
+      throw new Error('document_deferred');
+    }
+    if (streamMode && response.data && typeof response.data.on === 'function') {
+      const chunks = [];
+      for await (const chunk of response.data) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      response.data = decodeBody(Buffer.concat(chunks), response.headers?.['content-type'] || '');
     }
     return response;
   }
