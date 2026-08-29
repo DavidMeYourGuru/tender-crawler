@@ -204,6 +204,47 @@ test('Detail-Bundle speichert aktuelle Textabschnitte und generische Fakten', ()
   assert.equal(detail.facts.length, 0);
 });
 
+test('Detail-Bundle-Roundtrip erhält Lose, Kriterien, Dokumente, Nachrichten, Snapshots, Facts und Metadata', () => {
+  const tender = makeTender({
+    sourceId: 'ted', externalId: 'roundtrip-all-001', portalProjectId: 'roundtrip-all-001',
+    detailStatus: 'complete', fullCrawlSucceeded: true,
+    detailCompleteness: { overall: 'complete', sections: { xml: 'complete', documents: 'complete', communication: 'not_offered' } },
+    portalMetadata: { organizations: [{ name: 'Testorganisation' }], deadlines: [{ kind: 'submission', dateTime: '2026-12-15T12:30:00+01:00' }] },
+    detailBundle: {
+      fullCrawlSucceeded: true,
+      completeness: { overall: 'complete', sections: { xml: 'complete', documents: 'complete', communication: 'not_offered' } },
+      metadata: { organizations: [{ name: 'Testorganisation' }] },
+      lots: [{ lotKey: '1', lotNumber: '1', title: 'Los 1', cpvCodes: ['38000000'] }],
+      criteria: [{ criterionKey: 'price', kind: 'award', title: 'Preis', description: 'Preisgewichtung', lotKey: '1' }],
+      documents: [{ portalFileId: 'doc-1', filename: 'spec.pdf', downloadStatus: 'not_requested', locator: { href: 'https://example.test/spec.pdf' } }],
+      messages: [{ portalMessageId: 'msg-1', subject: 'Frage', body: 'Antwort', attachments: [] }],
+      snapshots: [{ kind: 'ted:xml', sourceUrl: 'https://example.test/notice.xml', content: '<Notice/>' }],
+      textSections: [{ sectionKey: 'ted-xml', title: 'TED XML', text: 'Vollständiger XML-Text.' }],
+      facts: [{ factKey: 'ted:deadline', sectionKey: 'ted-xml', label: 'Frist', valueText: '2026-12-15T12:30:00+01:00', normalizedValue: { dateTime: '2026-12-15T12:30:00+01:00' }, dataType: 'date-time' }],
+    },
+  });
+  const result = saveTender(tender);
+  const detail = getTenderBundleById(result.tenderId);
+  assert.equal(detail.lots[0].title, 'Los 1');
+  assert.equal(detail.lots[0].lot_key, '1');
+  assert.equal(detail.criteria[0].lot_id, detail.lots[0].id);
+  assert.equal(detail.documents[0].download_status, 'not_requested');
+  assert.equal(detail.messages[0].subject, 'Frage');
+  assert.equal(detail.snapshots[0].kind, 'ted:xml');
+  assert.equal(detail.textSections[0].text, 'Vollständiger XML-Text.');
+  assert.equal(detail.facts[0].data_type, 'date-time');
+  assert.equal(detail.metadata.organizations[0].name, 'Testorganisation');
+});
+
+test('Unvollständiger Detailabruf überschreibt keinen vollständigen Bestand', () => {
+  const tender = makeTender({ sourceId: 'dtvp', externalId: 'partial-preserve-001', detailStatus: 'complete', fullCrawlSucceeded: true, description: 'Vollständiger Bestand' });
+  const first = saveTender({ ...tender, detailBundle: { fullCrawlSucceeded: true, completeness: { overall: 'complete' }, textSections: [{ sectionKey: 'overview', text: 'vollständig' }] } });
+  const result = saveTender({ ...tender, description: 'Verkürzte Fehlerseite', detailStatus: 'partial', detailBundle: { fullCrawlSucceeded: false, completeness: { overall: 'partial', sections: { documents: 'temporary_error:timeout' } }, textSections: [{ sectionKey: 'overview', text: 'Fehlerseite' }] } });
+  assert.equal(result.changed, false);
+  assert.equal(getTenderById(first.tenderId).description, 'Vollständiger Bestand');
+  assert.equal(getTenderBundleById(first.tenderId).textSections[0].text, 'vollständig');
+});
+
 test('Detail-Bundle wird atomar gespeichert und fehlerhafte Bundles hinterlassen keinen Kerndatensatz', () => {
   const circular = {};
   circular.self = circular;

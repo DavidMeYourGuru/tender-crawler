@@ -97,10 +97,21 @@ test('fehlgeschlagener Job geht auf retry, dann failed', () => {
   assert.equal(db.prepare('SELECT status FROM crawl_jobs WHERE id=?').get(job.id).status, 'failed');
 });
 
-test('requestCancelJob setzt cancel_requested', () => {
+test('requestCancelJob bricht einen wartenden Job sofort ab', () => {
   const job = enqueueBrowserJob('evergabe');
-  requestCancelJob(job.id);
-  assert.equal(db.prepare('SELECT cancel_requested FROM crawl_jobs WHERE id=?').get(job.id).cancel_requested, 1);
+  const cancelled = requestCancelJob(job.id);
+  assert.equal(cancelled.cancel_requested, 1);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(hasActiveBrowserJob('evergabe'), false);
+});
+
+test('requestCancelJob bricht einen veralteten laufenden Job sofort ab', () => {
+  const job = enqueueBrowserJob('evergabe');
+  claimNextBrowserJob('worker-1');
+  db.prepare('UPDATE crawl_jobs SET heartbeat_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', job.id);
+  const cancelled = requestCancelJob(job.id);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(cancelled.cancel_requested, 1);
 });
 
 test('recoverStaleJobs setzt verwaiste Lauf-Jobs auf retry', () => {

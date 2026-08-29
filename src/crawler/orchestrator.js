@@ -19,6 +19,7 @@ import { processDiscoveredInbox } from '../discovery/pipeline.js';
 const registry = new RateLimiterRegistry(new RateLimiter(config.maxRequestsPerMinute, 60000));
 let activeCrawl = null;
 let crawlState = { running: false, message: 'Noch kein Crawl in diesem Prozess.', startedAt: null };
+let crawlCancelRequested = false;
 
 const DETAIL_REFRESH_OPEN_MS = 24 * 60 * 60 * 1000;
 const DETAIL_REFRESH_CLOSED_MS = 7 * 24 * 60 * 60 * 1000;
@@ -42,6 +43,7 @@ async function withRetry(fn, { retries = 2, baseDelayMs = 2000 } = {}) {
     try {
       return await fn();
     } catch (error) {
+      if (error.cancelled) throw error;
       lastError = error;
       if (attempt < retries) {
         const delay = baseDelayMs * 2 ** attempt;
@@ -60,15 +62,51 @@ export function getCrawlStatus() {
   return { ...crawlState };
 }
 
+function throwIfCrawlCancelled() {
+  if (crawlCancelRequested) {
+    throw Object.assign(new Error('Crawl wurde abgebrochen'), { cancelled: true });
+  }
+}
+
+export function requestCrawlCancel() {
+  if (!activeCrawl || !crawlState.running) return false;
+  crawlCancelRequested = true;
+  crawlState = { ...crawlState, cancelRequested: true, message: 'Abbruch angefordert' };
+  return true;
+}
+
 /**
  * Führt einen Crawl für alle (oder ausgewählte) Quellen durch.
  */
 export async function runCrawl({ sources: sourceIds = null, enrich = true } = {}) {
   if (activeCrawl) return activeCrawl;
 
-  activeCrawl = doCrawl({ sourceIds, enrich }).finally(() => {
-    activeCrawl = null;
-  });
+  crawlCancelRequested = false;
+  activeCrawl = doCrawl({ sourceIds, enrich })
+    .catch((error) => {
+      if (error.cancelled) {
+        crawlState = {
+          ...crawlState,
+          running: false,
+          cancelRequested: false,
+          finishedAt: new Date().toISOString(),
+          message: 'Crawl abgebrochen',
+        };
+        return crawlState;
+      }
+      crawlState = {
+        ...crawlState,
+        running: false,
+        cancelRequested: false,
+        finishedAt: new Date().toISOString(),
+        message: `Crawl fehlgeschlagen: ${error.message}`,
+      };
+      throw error;
+    })
+    .finally(() => {
+      activeCrawl = null;
+      crawlCancelRequested = false;
+    });
   return activeCrawl;
 }
 
@@ -138,6 +176,7 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
     return metricsBySource.get(sourceId);
   };
   for (const id of tenderIds) {
+    throwIfCrawlCancelled();
     const tender = getTenderById(id);
     if (!tender) continue;
     const portalModule = portals.get(tender.source_id);
@@ -241,6 +280,7 @@ export async function enrichTenders(tenderIds, { force = false, crawlLogIds = nu
       saveTender(updated);
       enriched += 1;
     } catch (error) {
+      if (error.cancelled) throw error;
       metricsFor(tender.source_id).detailPagesFailed += 1;
       if (report) report.failed = (report.failed || 0) + 1;
       console.error(`[enrich] Detail für Tender ${id} (${tender.title}) fehlgeschlagen:`, error.message);
@@ -267,8 +307,10 @@ async function doCrawl({ sourceIds, enrich }) {
   // der separate Playwright-Worker übernimmt sie asynchron.
   const browserSummaries = await enqueueBrowserCrawlJobs({ sources: sourceList });
   summaries.push(...browserSummaries);
+  throwIfCrawlCancelled();
 
   for (const [portalId, portal] of portals) {
+    throwIfCrawlCancelled();
     const source = getSource(portalId);
     if (!source?.enabled) continue;
     if (sourceList && !sourceList.includes(portalId)) continue;
@@ -276,24 +318,29 @@ async function doCrawl({ sourceIds, enrich }) {
 
     const summary = await crawlOneSource(portalId, portal, source);
     summaries.push(summary);
+    throwIfCrawlCancelled();
   }
 
   let enriched = 0;
   if (enrich) {
+    throwIfCrawlCancelled();
     const enrichable = summaries.flatMap((s) => s.tenderIds || []);
     if (enrichable.length) {
       const crawlLogIds = Object.fromEntries(
         summaries.filter((summary) => summary.id && summary.sourceId).map((summary) => [summary.sourceId, summary.id])
       );
       enriched = await enrichTenders(enrichable, { crawlLogIds });
+      throwIfCrawlCancelled();
     }
   }
 
   // Verwaltete http-Quellen (Katalog) für Ausschreibungen einbeziehen
   if (config.crawlSourcesEnabled && (!sourceList || sourceList.includes('managed'))) {
+    throwIfCrawlCancelled();
     const managed = await runManagedTenderSources();
     summaries.push(...managed.summaries);
     totalManagedNew += managed.itemsNew;
+    throwIfCrawlCancelled();
   }
 
   const totalNew = summaries.reduce((sum, s) => sum + s.itemsNew, 0) + totalManagedNew;
@@ -302,6 +349,7 @@ async function doCrawl({ sourceIds, enrich }) {
   const queuedNote = queuedJobs.length ? ` | Browser-Jobs eingereiht: ${queuedJobs.join(', ')}` : '';
   crawlState = {
     running: false,
+    cancelRequested: false,
     startedAt,
     finishedAt: new Date().toISOString(),
     message: `Crawl beendet: ${totalNew} neu, ${totalChanged} geändert${enriched ? `, ${enriched} angereichert` : ''}${queuedNote}`,
@@ -327,6 +375,7 @@ async function crawlOneSource(portalId, portal, source) {
   const now = new Date().toISOString();
 
   try {
+    throwIfCrawlCancelled();
     const rateLimit = portal.meta?.rateLimit || { maxRequests: 15, windowMs: 60000 };
     const limiter = registry.for(portalId, rateLimit.maxRequests, rateLimit.windowMs);
     const tenders = await withRetry(() =>
@@ -335,10 +384,12 @@ async function crawlOneSource(portalId, portal, source) {
         rateLimiter: limiter,
       })
     );
+    throwIfCrawlCancelled();
     summary.itemsDiscovered = tenders.length;
 
     for (const tender of tenders) {
       try {
+        throwIfCrawlCancelled();
         // Respektvolle Verzögerung zwischen den Requests
         await sleep(config.requestDelayMs);
         const result = await withRetry(
@@ -352,13 +403,14 @@ async function crawlOneSource(portalId, portal, source) {
           summary.itemsChanged += 1;
           summary.tenderIds.push(result.tenderId);
         }
-        // NRW liefert Listendaten und Detaildaten getrennt. Auch ein bereits
-        // bekannter Treffer muss bei fehlender Detailanreicherung erneut in
-        // die Enrich-Phase gelangen.
-        if (portalId === 'nrw' && !summary.tenderIds.includes(result.tenderId)) {
+        // Jede aktive HTTP/API-Quelle kann bereits bekannte, fällige oder
+        // unvollständige Detaildaten nachladen. So werden nicht nur neue
+        // Treffer angereichert; NRW bleibt dabei vollständig kompatibel.
+        if (isDetailDue(getTenderById(result.tenderId)) && !summary.tenderIds.includes(result.tenderId)) {
           summary.tenderIds.push(result.tenderId);
         }
       } catch (error) {
+        if (error.cancelled) throw error;
         summary.errors += 1;
         console.error(`[${portalId}] Speichern von Tender fehlgeschlagen (${tender.title}):`, error.message);
       }
@@ -367,6 +419,11 @@ async function crawlOneSource(portalId, portal, source) {
     updateSourceCrawlTime(portalId, now);
     summary.status = summary.errors > 0 ? 'completed_with_errors' : 'completed';
   } catch (error) {
+    if (error.cancelled) {
+      summary.status = 'cancelled';
+      summary.errorMessage = error.message;
+      throw error;
+    }
     summary.status = 'failed';
     summary.errorMessage = error.stack || error.message;
     summary.errors += 1;
@@ -413,4 +470,4 @@ async function runManagedTenderSources() {
   return { summaries, itemsNew };
 }
 
-export default { runCrawl, getCrawlStatus, enrichTenders };
+export default { runCrawl, getCrawlStatus, requestCrawlCancel, enrichTenders };

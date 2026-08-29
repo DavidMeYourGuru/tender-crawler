@@ -6,6 +6,9 @@ const TOKEN_KEY = 'tender_crawler_token';
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
   view: 'tenders',
+  inboxTab: 'unseen',
+  activeProfileId: localStorage.getItem('tender_active_profile') || '',
+  profiles: [],
   page: 1,
   filters: {
     q: '',
@@ -29,10 +32,14 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+function showActionError(message) {
+  const target = $('active-profile-description');
+  if (target) { target.textContent = message; target.classList.add('error'); setTimeout(() => { target.classList.remove('error'); updateProfileHeader(); }, 4000); }
+}
 
 /* ---------- View-Umschaltung ---------- */
 
-const VIEWS = ['tenders', 'funding', 'funding-chat'];
+const VIEWS = ['tenders', 'profiles', 'admin', 'funding', 'funding-chat'];
 
 function viewFromHash() {
   const h = (location.hash || '').replace(/^#/, '');
@@ -41,20 +48,29 @@ function viewFromHash() {
 
 function switchView(view) {
   const target = VIEWS.includes(view) ? view : 'tenders';
+  if (target === 'tenders') state.inboxTab = 'unseen';
   state.view = target;
   const isTenders = target === 'tenders';
   const isFunding = target === 'funding';
   const isChat = target === 'funding-chat';
   $('app').classList.toggle('hidden', !isTenders);
+  $('profiles-app').classList.toggle('hidden', target !== 'profiles');
+  $('admin-app').classList.toggle('hidden', target !== 'admin');
   $('funding-app').classList.toggle('hidden', !isFunding);
   $('funding-chat-app').classList.toggle('hidden', !isChat);
-  $('tab-tenders').classList.toggle('active', isTenders);
+  $('tab-tenders').classList.toggle('active', target === 'tenders');
+  $('tab-profiles').classList.toggle('active', target === 'profiles');
+  $('tab-admin').classList.toggle('active', target === 'admin');
+  document.querySelectorAll('[data-inbox-tab]').forEach((tab) => tab.classList.toggle('active', tab.dataset.inboxTab === state.inboxTab));
   $('tab-funding').classList.toggle('active', isFunding);
   $('tab-funding-chat').classList.toggle('active', isChat);
   // Tab im URL-Hash festhalten, damit er beim Reload erhalten bleibt.
   // replaceState löst kein hashchange aus → keine Endlosschleife.
   history.replaceState(null, '', `#${target}`);
   if (isTenders) loadTenders();
+  if (isTenders) loadSearchProfiles();
+  if (target === 'profiles') loadSearchProfiles();
+  if (target === 'admin') { loadCrawls(); loadAdminSources(); }
   if (isFunding) loadFundingAll();
   if (isChat) initFundingChat();
 }
@@ -66,6 +82,8 @@ window.addEventListener('hashchange', () => {
 });
 
 $('tab-tenders').addEventListener('click', () => switchView('tenders'));
+$('tab-profiles').addEventListener('click', () => switchView('profiles'));
+$('tab-admin').addEventListener('click', () => switchView('admin'));
 $('tab-funding').addEventListener('click', () => switchView('funding'));
 $('tab-funding-chat').addEventListener('click', () => switchView('funding-chat'));
 
@@ -140,6 +158,26 @@ $('login-form').addEventListener('submit', async (event) => {
 $('btn-logout').addEventListener('click', () => {
   setToken('');
   showLogin();
+});
+
+$('active-profile').addEventListener('change', () => {
+  state.activeProfileId = $('active-profile').value;
+  if (state.activeProfileId) localStorage.setItem('tender_active_profile', state.activeProfileId); else localStorage.removeItem('tender_active_profile');
+  state.inboxTab = 'unseen'; document.querySelectorAll('[data-inbox-tab]').forEach((tab) => tab.classList.toggle('active', tab.dataset.inboxTab === state.inboxTab));
+  updateProfileHeader(); loadTenders(); loadSearchProfiles();
+});
+document.querySelectorAll('[data-inbox-tab]').forEach((tab) => tab.addEventListener('click', () => {
+  state.inboxTab = tab.dataset.inboxTab; document.querySelectorAll('[data-inbox-tab]').forEach((item) => item.classList.toggle('active', item === tab)); loadTenders();
+}));
+$('btn-new-profile').addEventListener('click', () => showProfileForm());
+$('btn-cancel-profile').addEventListener('click', () => $('profile-form').classList.add('hidden'));
+$('profile-form').addEventListener('submit', async (event) => {
+  event.preventDefault(); const id = $('profile-id').value;
+  const cpvCodes = $('profile-cpvs').value.split(',').map((v) => v.trim()).filter(Boolean);
+  const invalidCpvs = cpvCodes.filter((value) => !/^\d{8}(?:-\d)?$/.test(value));
+  if (invalidCpvs.length) { $('profile-form-error').textContent = `Ungültige CPV-Codes: ${invalidCpvs.join(', ')}. Erwartet werden 8 Ziffern, optional mit Prüfziffer.`; $('profile-form-error').classList.remove('hidden'); return; }
+  const body = { name: $('profile-name').value.trim(), keywords: $('profile-keywords').value.trim(), cpvCodes, regions: $('profile-regions').value.split(',').map((v) => v.trim()).filter(Boolean), sources: $('profile-sources').value.split(',').map((v) => v.trim()).filter(Boolean), statusFilter: $('profile-status').value, minLeadDays: $('profile-lead-days').value ? Number($('profile-lead-days').value) : null };
+  try { const result = await api(id ? `/api/searches/${id}` : '/api/searches', { method: id ? 'PUT' : 'POST', body }); if (!id && !state.activeProfileId) { state.activeProfileId = String(result.id); localStorage.setItem('tender_active_profile', state.activeProfileId); } $('profile-form-error').textContent = ''; $('profile-form-error').classList.add('hidden'); $('profile-form').classList.add('hidden'); await loadSearchProfiles(); if (state.view === 'profiles') renderProfiles(); } catch (error) { $('profile-form-error').textContent = error.message; $('profile-form-error').classList.remove('hidden'); }
 });
 
 /* ---------- Formatierung ---------- */
@@ -222,7 +260,10 @@ function linkify(text) {
 
 /* ---------- Status-Badge ---------- */
 
-let activeJobId = null;
+let activeJobIds = [];
+let cancelPollTimer = null;
+let directCrawlRunning = false;
+let crawlBusy = false;
 
 function jobModeLabel(job) {
   // Automatik-Modus: Backfill läuft, bis der Checkpoint vollständig ist
@@ -231,25 +272,42 @@ function jobModeLabel(job) {
 }
 
 function updateStatusBadge(crawl, analysis, jobs) {
-  const badge = $('status-badge');
+  const adminBadge = $('admin-status-badge');
+  const badge = adminBadge || $('status-badge');
+  const statusTitle = $('crawl-status-title');
   const jobStatusEl = $('job-status');
+  const startBtn = $('btn-crawl');
   const cancelBtn = $('btn-cancel-job');
-  const activeJob = (jobs?.active || [])[0] || null;
-  activeJobId = activeJob ? activeJob.id : null;
+  const activeJobs = jobs?.active || [];
+  const activeJob = activeJobs.find((job) => job.status === 'running') || activeJobs[0] || null;
+  const isBusy = Boolean(crawl?.running || activeJob || analysis?.running);
+  directCrawlRunning = Boolean(crawl?.running);
+  crawlBusy = Boolean(directCrawlRunning || activeJob);
+  activeJobIds = activeJobs.map((job) => job.id);
 
   if (crawl?.running) {
     badge.textContent = 'Crawl läuft';
     badge.className = 'badge badge-running';
+    statusTitle.textContent = 'Ausschreibungsquellen werden aktualisiert';
+    jobStatusEl.textContent = crawl.message || 'Der automatische Abruf läuft im Hintergrund.';
   } else if (activeJob) {
     badge.textContent = activeJob.status === 'running' ? 'Browser-Crawl läuft' : 'Browser-Crawl wartet';
     badge.className = 'badge badge-running';
+    statusTitle.textContent = activeJob.status === 'running' ? 'Eine Plattform wird durchsucht' : 'Browser-Crawl wartet auf Verarbeitung';
   } else if (analysis?.running) {
     badge.textContent = 'LLM-Analyse läuft';
     badge.className = 'badge badge-running';
+    statusTitle.textContent = 'Analyse läuft';
+    jobStatusEl.textContent = 'Während der Analyse kann kein neuer Crawl gestartet werden.';
   } else {
     badge.textContent = 'Bereit';
     badge.className = 'badge badge-idle';
+    statusTitle.textContent = 'Kein Crawl aktiv';
+    jobStatusEl.textContent = 'Die Quellen können manuell aktualisiert werden.';
   }
+
+  startBtn.classList.toggle('hidden', isBusy);
+  startBtn.disabled = isBusy;
 
   // Job-Fortschritt (einziger sichtbarer Browser-Job pro Quelle)
   if (activeJob) {
@@ -257,12 +315,15 @@ function updateStatusBadge(crawl, analysis, jobs) {
       ? ` · Seite ${activeJob.pages_done} (${activeJob.items_discovered} Treffer, ${activeJob.items_new} neu)`
       : '';
     jobStatusEl.textContent = `${jobModeLabel(activeJob)}: ${activeJob.source_name || activeJob.source_id}${progress}`;
-    jobStatusEl.classList.remove('hidden');
-    cancelBtn.classList.remove('hidden');
   } else {
-    jobStatusEl.classList.add('hidden');
-    cancelBtn.classList.add('hidden');
+    activeJobIds = [];
   }
+  const allBrowserJobsCancelling = activeJobs.length > 0 && activeJobs.every((job) => job.cancel_requested);
+  const cancellationRequested = (!directCrawlRunning || crawl?.cancelRequested)
+    && (!activeJobs.length || allBrowserJobsCancelling);
+  cancelBtn.classList.toggle('hidden', !crawlBusy);
+  cancelBtn.disabled = Boolean(cancellationRequested);
+  cancelBtn.textContent = cancellationRequested ? 'Abbruch angefordert' : 'Crawl abbrechen';
 }
 
 async function loadStatus() {
@@ -277,21 +338,7 @@ async function loadStatus() {
 /* ---------- Daten laden ---------- */
 
 async function refreshAll() {
-  await Promise.all([loadStats(), loadStatus(), loadCrawls(), loadSources(), loadTenders(), loadFundingStats(), loadFundingCrawls(), loadFundingPrograms()]);
-}
-
-async function loadStats() {
-  try {
-    const stats = await api('/api/stats');
-    $('stat-total-open').textContent = stats.totalOpen;
-    $('stat-new-today').textContent = stats.newToday;
-    $('stat-new-7d').textContent = stats.newSevenDays;
-    $('stat-closing-week').textContent = stats.closingWeek;
-    $('stat-closing-month').textContent = stats.closingMonth;
-    $('stat-analyzed').textContent = stats.analyzed;
-  } catch (error) {
-    console.error('Statistiken konnten nicht geladen werden:', error.message);
-  }
+  await Promise.all([loadStatus(), loadCrawls(), loadSources(), loadTenders(), loadSearchProfiles(), loadFundingStats(), loadFundingCrawls(), loadFundingPrograms()]);
 }
 
 async function loadSources() {
@@ -309,6 +356,7 @@ async function loadSources() {
       if (source.id === current) option.selected = true;
       select.appendChild(option);
     }
+    renderAdminSources(sources);
   } catch (error) {
     console.error('Quellen konnten nicht geladen werden:', error.message);
   }
@@ -345,13 +393,97 @@ async function loadCrawls() {
   }
 }
 
+function renderAdminSources(sources) {
+  const target = $('admin-source-list');
+  if (!target) return;
+  const visibleSources = sources.filter((source) => source.id !== 'bund');
+  if (!visibleSources.length) { target.innerHTML = '<p class="muted">Keine Ausschreibungsquellen vorhanden.</p>'; return; }
+  target.innerHTML = visibleSources.map((source) => `<div class="source-row"><div class="source-main"><strong>${escapeHtml(source.name || source.id)}</strong><span class="muted">${escapeHtml(source.region || '–')}</span></div><div class="source-meta"><span class="chip">${source.enabled ? 'Aktiv' : 'Deaktiviert'}</span><span class="muted">${source.last_crawl_at ? `Letzter Crawl: ${fmtDate(source.last_crawl_at)}` : 'Noch kein Crawl'}</span></div></div>`).join('');
+}
+
+async function loadAdminSources() {
+  try { const sources = await api('/api/sources'); renderAdminSources(sources); } catch (error) { const target = $('admin-source-list'); if (target) target.innerHTML = `<p class="error">Quellen konnten nicht geladen werden: ${escapeHtml(error.message)}</p>`; }
+}
+
+function profileArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  try { return JSON.parse(value) || []; } catch { return String(value).split(',').map((v) => v.trim()).filter(Boolean); }
+}
+
+async function loadSearchProfiles() {
+  try {
+    const data = await api('/api/searches');
+    state.profiles = data.searches || [];
+    if (state.activeProfileId && !state.profiles.some((profile) => String(profile.id) === String(state.activeProfileId))) {
+      state.activeProfileId = '';
+      localStorage.removeItem('tender_active_profile');
+      state.inboxTab = 'unseen';
+      ['count-all', 'count-watch', 'count-unseen', 'stat-total-open', 'stat-new-today', 'stat-new-7d'].forEach((id) => { if ($(id)) $(id).textContent = '0'; });
+      renderTenders({ total: 0, tenders: [], page: 1, totalPages: 0 });
+    }
+    const picker = $('active-profile');
+    if (picker) {
+      picker.innerHTML = '<option value="">Kein Profil ausgewählt</option>';
+      state.profiles.forEach((profile) => {
+        const option = document.createElement('option'); option.value = profile.id; option.textContent = profile.name;
+        if (String(profile.id) === String(state.activeProfileId)) option.selected = true;
+        picker.appendChild(option);
+      });
+    }
+    renderProfiles();
+    updateProfileHeader();
+    if (!state.activeProfileId) ['count-all', 'count-watch', 'count-unseen', 'stat-total-open', 'stat-new-today', 'stat-new-7d'].forEach((id) => { if ($(id)) $(id).textContent = '0'; });
+    if (state.activeProfileId) {
+      const counts = await api(`/api/searches/${state.activeProfileId}/counts`).catch(() => null);
+      if (counts) {
+        $('count-all').textContent = counts.total; $('count-watch').textContent = counts.watch; $('count-unseen').textContent = counts.unseen;
+        $('stat-total-open').textContent = counts.unseen; $('stat-new-today').textContent = counts.total; $('stat-new-7d').textContent = counts.watch;
+      }
+    }
+  } catch (error) { console.error('Suchprofile konnten nicht geladen werden:', error.message); }
+}
+
+function updateProfileHeader() {
+  const profile = state.profiles.find((item) => String(item.id) === String(state.activeProfileId));
+  $('active-profile-title').textContent = profile ? profile.name : 'Dein Posteingang';
+  $('active-profile-description').textContent = profile ? `${profile.keywords || 'CPV-basierte Suche'} · passende Verfahren aus deinem Suchprofil` : 'Wähle ein Suchprofil, um passende Verfahren zu sehen.';
+}
+
+function renderProfiles() {
+  const list = $('profile-list'); if (!list) return;
+  list.innerHTML = '';
+  if (!state.profiles.length) { list.innerHTML = '<div class="empty-state"><h3>Noch kein Suchprofil</h3><p>Erstelle ein Profil mit deinen CPV-Codes und Fachbegriffen.</p><button class="btn btn-primary" id="empty-new-profile">Profil anlegen</button></div>'; $('empty-new-profile')?.addEventListener('click', () => showProfileForm()); return; }
+  state.profiles.forEach((profile) => {
+    const card = document.createElement('article'); card.className = 'card profile-card';
+    const cpvs = profileArray(profile.cpv_codes); const regions = profileArray(profile.regions);
+    card.innerHTML = `<div class="profile-card-head"><h3>${escapeHtml(profile.name)}</h3><span class="chip">${profile.status_filter === 'open' ? 'Offen' : 'Aktiv'}</span></div><p class="muted">${escapeHtml(profile.keywords || 'Keine Suchbegriffe')}</p><div class="chip-group">${cpvs.map((cpv) => `<span class="chip">CPV ${escapeHtml(cpv)}</span>`).join('') || '<span class="muted">Keine CPVs</span>'}</div><small>${regions.length ? `Regionen: ${escapeHtml(regions.join(', '))}` : 'Alle Regionen'}${profile.min_lead_days != null ? ` · mindestens ${profile.min_lead_days} Tage Vorlauf` : ''}</small><div class="profile-actions"><button class="btn btn-primary" data-use="${profile.id}">Verwenden</button><button class="btn" data-edit="${profile.id}">Bearbeiten</button><button class="btn btn-ghost" data-delete="${profile.id}">Löschen</button></div>`;
+    card.querySelector('[data-use]').addEventListener('click', () => { state.activeProfileId = String(profile.id); localStorage.setItem('tender_active_profile', state.activeProfileId); switchView('tenders'); });
+    card.querySelector('[data-edit]').addEventListener('click', () => showProfileForm(profile));
+    card.querySelector('[data-delete]').addEventListener('click', async () => { if (confirm(`Profil „${profile.name}“ löschen?`)) { try { await api(`/api/searches/${profile.id}`, { method: 'DELETE' }); if (String(profile.id) === state.activeProfileId) { state.activeProfileId = ''; localStorage.removeItem('tender_active_profile'); } await loadSearchProfiles(); } catch (error) { showActionError(error.message); } } });
+    list.appendChild(card);
+  });
+}
+
+function showProfileForm(profile = null) {
+  $('profile-form').classList.remove('hidden'); $('profile-form-title').textContent = profile ? 'Suchprofil bearbeiten' : 'Neues Suchprofil';
+  $('profile-form-error').textContent = ''; $('profile-form-error').classList.add('hidden');
+  $('profile-id').value = profile?.id || ''; $('profile-name').value = profile?.name || ''; $('profile-keywords').value = profile?.keywords || '';
+  $('profile-cpvs').value = profileArray(profile?.cpv_codes).join(', '); $('profile-regions').value = profileArray(profile?.regions).join(', '); $('profile-sources').value = profileArray(profile?.sources).join(', '); $('profile-status').value = profile?.status_filter || 'open'; $('profile-lead-days').value = profile?.min_lead_days ?? '';
+  $('profile-name').focus();
+}
+
 async function loadTenders() {
   try {
+    if (!state.activeProfileId) { renderTenders({ total: 0, tenders: [], page: 1, totalPages: 0 }); return; }
     const params = new URLSearchParams({
       page: state.page,
       limit: 25,
       sort: state.filters.sort,
     });
+    params.set('profile_id', state.activeProfileId);
+    if (state.inboxTab === 'watch') params.set('user_state', 'watch');
+    if (state.inboxTab === 'unseen') params.set('user_state', 'unseen');
     if (state.filters.q) params.set('q', state.filters.q);
     if (state.filters.sources) params.set('sources', state.filters.sources);
     if (state.filters.regions) params.set('regions', state.filters.regions);
@@ -373,7 +505,10 @@ function renderTenders(data) {
   $('tender-count').textContent = `(${data.total})`;
 
   if (!data.tenders.length) {
-    list.innerHTML = '<div class="tender-item"><div class="tender-title">Keine Ausschreibungen gefunden.</div></div>';
+    list.innerHTML = state.activeProfileId
+      ? '<div class="empty-state"><h3>Keine Treffer in dieser Ansicht</h3><p>Neue passende Ausschreibungen erscheinen nach dem nächsten Crawl.</p></div>'
+      : '<div class="empty-state"><h3>Starte mit einem Suchprofil</h3><p>Definiere CPV-Codes und Fachbegriffe, damit hier relevante Verfahren erscheinen.</p><button class="btn btn-primary" id="empty-profile-cta">Suchprofil anlegen</button></div>';
+    $('empty-profile-cta')?.addEventListener('click', () => switchView('profiles'));
     $('pagination').innerHTML = '';
     return;
   }
@@ -381,30 +516,26 @@ function renderTenders(data) {
   for (const tender of data.tenders) {
     const item = document.createElement('div');
     item.className = 'tender-item';
-    const hasLlm = tender.llm_relevance_score != null;
-
-    let relevanceHtml = '';
-    if (hasLlm) {
-      const pct = Math.round(tender.llm_relevance_score * 100);
-      relevanceHtml = `
-        <span class="chip chip-status-open">Relevanz ${pct}%</span>
-        <span class="relevance-bar"><span class="fill" style="width:${pct}%"></span></span>
-      `;
-    }
-
+    const deadlineDays = daysUntil(tender.submission_deadline);
+    const cpvChips = (tender.cpv_codes || []).slice(0, 4).map((code) => `<span class="chip">CPV ${escapeHtml(code)}</span>`).join('');
+    const activeProfile = state.profiles.find((profile) => String(profile.id) === String(state.activeProfileId));
+    const tenderText = `${tender.title || ''} ${tender.description || ''}`.toLowerCase();
+    const matchedCpvs = activeProfile ? profileArray(activeProfile.cpv_codes).filter((code) => (tender.cpv_codes || []).some((candidate) => String(candidate).startsWith(String(code)))) : [];
+    const matchedKeywords = activeProfile ? String(activeProfile.keywords || '').split(/[,\n]+/).map((value) => value.trim()).filter((value) => value && tenderText.includes(value.toLowerCase())) : [];
+    const matchReasons = [...matchedCpvs.map((code) => `CPV ${code}`), ...matchedKeywords].slice(0, 4);
     item.innerHTML = `
-      <div class="tender-title">${escapeHtml(tender.title)}</div>
+      <div class="tender-card-top"><div class="tender-title">${escapeHtml(tender.title)}</div><span class="deadline ${deadlineDays != null && deadlineDays < 14 ? 'deadline-soon' : ''}">${deadlineDays != null ? `in ${Math.max(0, deadlineDays)} Tagen` : 'Keine Frist'}</span></div>
       <div class="tender-meta">
-        <span class="chip chip-status-${escapeHtml(tender.status)}">${escapeHtml(statusLabel[tender.status] || tender.status)}</span>
-        <span class="chip">${escapeHtml(tender.source_name || tender.source_id)}</span>
+        <span>${escapeHtml(tender.contracting_authority || tender.source_name || tender.source_id || 'Auftraggeber unbekannt')}</span>
+        <span>${escapeHtml(tender.place_of_performance || 'Ort nicht angegeben')}</span>
         ${tender.submission_deadline ? `<span>Frist: ${fmtDate(tender.submission_deadline)}</span>` : ''}
-        ${tender.estimated_value_cents != null ? `<span>${escapeHtml(fmtCents(tender.estimated_value_cents, tender.estimated_value_currency))}</span>` : ''}
-        ${tender.place_of_performance ? `<span>${escapeHtml(tender.place_of_performance)}</span>` : ''}
-        ${relevanceHtml}
       </div>
-      ${tender.llm_summary ? `<div class="tender-summary">${escapeHtml(tender.llm_summary)}</div>` : ''}
-      ${tender.description ? `<div class="tender-summary">${escapeHtml(tender.description)}</div>` : ''}
+      <div class="chip-group">${cpvChips || '<span class="muted">Keine CPV-Angabe</span>'}</div>
+      <div class="match-reason"><strong>Passt wegen:</strong> ${escapeHtml(matchReasons.join(', ') || 'passendem Suchprofil')}</div>
+      <div class="tender-actions"><button class="btn btn-small" data-state="${tender.user_state === 'watch' ? 'seen' : 'watch'}">${tender.user_state === 'watch' ? '★ Beobachtet · entfernen' : '☆ Beobachten'}</button><button class="btn btn-small btn-ghost" data-state="dismiss">Unpassend</button><button class="btn btn-small btn-ghost" data-details>Details</button></div>
     `;
+    item.querySelector('[data-details]').addEventListener('click', (event) => { event.stopPropagation(); openDetail(tender.id); });
+    item.querySelectorAll('[data-state]').forEach((button) => button.addEventListener('click', async (event) => { event.stopPropagation(); try { await api(`/api/tenders/${tender.id}/state`, { method: 'POST', body: { state: button.dataset.state } }); await loadTenders(); await loadSearchProfiles(); } catch (error) { showActionError(error.message); } }));
     item.addEventListener('click', () => openDetail(tender.id));
     list.appendChild(item);
   }
@@ -954,6 +1085,10 @@ $('btn-funding-apply').addEventListener('click', applyFundingFilters);
 async function openDetail(id) {
   try {
     const tender = await api(`/api/tenders/${id}`);
+    // Das Öffnen zählt als gelesen; Beobachtet/Unpassend bleiben erhalten.
+    if (tender.user_state === 'unseen') {
+      try { await api(`/api/tenders/${id}/state`, { method: 'POST', body: { state: 'seen' } }); tender.user_state = 'seen'; await loadSearchProfiles(); await loadTenders(); } catch (error) { showActionError(error.message); }
+    }
     const content = $('detail-content');
 
     const reqs = Array.isArray(tender.llm_requirements)
@@ -1005,31 +1140,19 @@ async function openDetail(id) {
       .join('');
 
     content.innerHTML = `
-      <h2>${escapeHtml(tender.title)}</h2>
+      <div class="detail-title-row"><h2>${escapeHtml(tender.title)}</h2><div class="tender-actions"><button class="btn btn-small" id="detail-watch">${tender.user_state === 'watch' ? '★ Beobachtet' : '☆ Beobachten'}</button><button class="btn btn-small btn-ghost" id="detail-dismiss">Unpassend</button></div></div>
       <div class="detail-section">
-        <h3>Allgemein</h3>
-        <p><strong>Quelle:</strong> ${escapeHtml(tender.source_name || tender.source_id)}</p>
-        <p><strong>Externe ID:</strong> ${escapeHtml(tender.external_id || '–')}</p>
-        <p><strong>Portal-Projekt:</strong> ${escapeHtml(tender.portal_project_id || '–')}</p>
-        <p><strong>Status:</strong> ${escapeHtml(statusLabel[tender.status] || tender.status)}</p>
-        <p><strong>Portalstatus:</strong> ${escapeHtml(tender.portal_status || '–')}</p>
-        <p><strong>Verfahrensnummer:</strong> ${escapeHtml(tender.reference_number || '–')}</p>
-        <p><strong>Verfahrensart:</strong> ${escapeHtml(tender.procedure_type || tender.tender_type || '–')}</p>
-        <p><strong>Veröffentlichung:</strong> ${fmtDate(tender.publication_date)}</p>
-        <p><strong>Frist:</strong> ${fmtDate(tender.submission_deadline)}</p>
-        <p><strong>Bindefrist:</strong> ${fmtDate(tender.binding_period)}</p>
+        <h3>Entscheidungsgrundlage</h3>
+        <p><strong>Abgabefrist:</strong> ${fmtDate(tender.submission_deadline)}${daysUntil(tender.submission_deadline) != null ? ` (in ${Math.max(0, daysUntil(tender.submission_deadline))} Tagen)` : ''}</p>
         <p><strong>Frist für Fragen:</strong> ${fmtDate(tender.question_deadline)}</p>
-        <p><strong>Öffnung:</strong> ${fmtDate(tender.opening_date)}</p>
-        <p><strong>Laufzeit:</strong> ${escapeHtml(tender.contract_duration || '–')}</p>
         <p><strong>Wert:</strong> ${escapeHtml(fmtCents(tender.estimated_value_cents, tender.estimated_value_currency))}</p>
         <p><strong>Auftraggeber:</strong> ${escapeHtml(tender.contracting_authority || '–')}</p>
         <p><strong>Leistungsort:</strong> ${escapeHtml(tender.place_of_performance || '–')}</p>
-        <p><strong>Zuschlagskriterien:</strong> ${escapeHtml(tender.award_criteria || '–')}</p>
         ${safeHttpUrl(tender.url) ? `<p><a href="${escapeHtml(safeHttpUrl(tender.url))}" target="_blank" rel="noopener noreferrer">Zur Ausschreibung ↗</a></p>` : ''}
       </div>
       ${tender.description ? `
       <div class="detail-section">
-        <h3>Beschreibung</h3>
+        <h3>Leistungsgegenstand</h3>
         <p>${linkify(tender.description)}</p>
       </div>` : ''}
       ${tender.cpv_labels?.length || tender.cpv_codes?.length ? `
@@ -1045,6 +1168,7 @@ async function openDetail(id) {
         <h3>Kriterien</h3>
         ${criteriaHtml}
       </div>
+      <details class="technical-details"><summary>Technische Details</summary>
       <div class="detail-section">
         <h3>Vollständigkeit</h3>
         <p><strong>Gesamt:</strong> ${escapeHtml(tender.completeness_status?.overall || tender.detail_status || '–')}</p>
@@ -1084,7 +1208,10 @@ async function openDetail(id) {
         <h3>Letzte Änderungen</h3>
         <ul>${changes}</ul>
       </div>` : ''}
+      </details>
     `;
+    $('detail-watch').addEventListener('click', async () => { try { const nextState = tender.user_state === 'watch' ? 'seen' : 'watch'; await api(`/api/tenders/${tender.id}/state`, { method: 'POST', body: { state: nextState } }); tender.user_state = nextState; $('detail-watch').textContent = nextState === 'watch' ? '★ Beobachtet' : '☆ Beobachten'; await loadTenders(); await loadSearchProfiles(); } catch (error) { showActionError(error.message); } });
+    $('detail-dismiss').addEventListener('click', async () => { try { await api(`/api/tenders/${tender.id}/state`, { method: 'POST', body: { state: 'dismiss' } }); $('detail-overlay').classList.add('hidden'); await loadTenders(); await loadSearchProfiles(); } catch (error) { showActionError(error.message); } });
     $('detail-overlay').classList.remove('hidden');
   } catch (error) {
     console.error('Detail konnte nicht geladen werden:', error.message);
@@ -1113,12 +1240,10 @@ $('btn-crawl').addEventListener('click', async () => {
   } catch (error) {
     $('action-msg').textContent = `Fehler: ${error.message}`;
   } finally {
-    btn.disabled = false;
     setTimeout(() => {
       $('action-msg').textContent = '';
       loadStatus();
       loadCrawls();
-      loadStats();
     }, 1000);
   }
 });
@@ -1158,16 +1283,54 @@ $('filter-cpv').addEventListener('input', scheduleLiveSearch);
 
 $('btn-apply-filters').addEventListener('click', applyFilters);
 
-$('btn-refresh').addEventListener('click', () => refreshAll());
+$('btn-refresh').addEventListener('click', async () => {
+  const btn = $('btn-refresh');
+  btn.disabled = true;
+  btn.textContent = '⟳ Wird geprüft …';
+  try {
+    await Promise.all([loadStatus(), loadCrawls(), loadAdminSources()]);
+    $('action-msg').textContent = `Status geprüft um ${new Date().toLocaleTimeString('de-DE')}.`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⟳ Status prüfen';
+  }
+});
 
 $('btn-cancel-job').addEventListener('click', async () => {
-  if (!activeJobId) return;
+  if (!crawlBusy) return;
+  const btn = $('btn-cancel-job');
+  btn.disabled = true;
+  btn.textContent = 'Abbruch wird angefordert …';
   try {
-    await api(`/api/jobs/${activeJobId}/cancel`, { method: 'POST' });
-    $('action-msg').textContent = 'Browser-Job wird abgebrochen …';
-    setTimeout(() => { $('action-msg').textContent = ''; refreshAll(); }, 2000);
+    const jobIds = [...activeJobIds];
+    const requests = jobIds.map((jobId) => api(`/api/jobs/${jobId}/cancel`, { method: 'POST' }));
+    if (directCrawlRunning) requests.push(api('/api/crawl/cancel', { method: 'POST' }));
+    await Promise.all(requests);
+    await Promise.all([loadStatus(), loadCrawls(), loadAdminSources()]);
+    $('action-msg').textContent = crawlBusy
+      ? 'Abbruch angefordert. Laufende Abrufe werden noch beendet.'
+      : 'Crawl abgebrochen. Du kannst ihn jetzt neu starten.';
+    clearTimeout(cancelPollTimer);
+    const pollCancellation = async (attempt = 0) => {
+      await Promise.all([loadStatus(), loadCrawls(), loadAdminSources()]);
+      if (!crawlBusy) {
+        $('action-msg').textContent = 'Crawl abgebrochen. Du kannst ihn jetzt neu starten.';
+        return;
+      }
+      if (!activeJobIds.length && directCrawlRunning) {
+        $('action-msg').textContent = 'Browser-Jobs sind beendet. Der aktuelle Quellenabruf läuft noch aus.';
+      }
+      if (attempt >= 149) {
+        $('action-msg').textContent = 'Der Abbruch dauert länger als erwartet. Bitte den Status erneut prüfen.';
+        return;
+      }
+      cancelPollTimer = setTimeout(() => pollCancellation(attempt + 1), 2000);
+    };
+    if (crawlBusy) cancelPollTimer = setTimeout(() => pollCancellation(), 1000);
   } catch (error) {
     $('action-msg').textContent = `Abbruch fehlgeschlagen: ${error.message}`;
+    btn.disabled = false;
+    btn.textContent = 'Crawl abbrechen';
   }
 });
 
@@ -1389,5 +1552,4 @@ api('/api/status')
 setInterval(() => {
   if (!state.token || $('app').classList.contains('hidden')) return;
   loadStatus();
-  loadStats();
 }, 30000);

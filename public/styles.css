@@ -169,6 +169,15 @@ body {
   color: var(--on-surface);
 }
 
+.btn-danger {
+  background: var(--danger-container);
+  color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: #f9d8d5;
+}
+
 .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
@@ -527,6 +536,50 @@ main {
 .detail-section li {
   padding: 4px 0;
 }
+
+/* Profilspezifische Inbox */
+.inbox-hero { display:flex; justify-content:space-between; align-items:end; gap:2rem; margin:2rem 0 1.25rem; }
+.inbox-hero h2, .section-heading h2 { margin:.25rem 0; font-size:clamp(1.5rem, 3vw, 2.2rem); letter-spacing:-.03em; }
+.eyebrow { margin:0; color:var(--accent, #5c7c67); font-size:.75rem; text-transform:uppercase; letter-spacing:.13em; font-weight:700; }
+.muted { color:var(--muted, #6b7280); }
+.profile-picker-wrap { min-width:14rem; display:grid; gap:.35rem; }
+.profile-picker-wrap label, .profile-form label { font-size:.8rem; font-weight:650; color:var(--muted, #6b7280); }
+.inbox-tabs { display:flex; gap:.35rem; border-bottom:1px solid var(--border, #e5e7eb); margin-bottom:1rem; }
+.subtab { border:0; background:none; padding:.75rem 1rem; color:var(--muted, #6b7280); cursor:pointer; border-bottom:2px solid transparent; }
+.subtab.active { color:var(--text, #1f2937); border-color:var(--accent, #5c7c67); font-weight:700; }
+.subtab span { background:var(--surface-alt, #f0f3ef); border-radius:999px; padding:.1rem .45rem; font-size:.75rem; }
+.profile-stats { grid-template-columns:repeat(3, 1fr); }
+.profile-stats .stat-card:nth-child(n+4) { display:none; }
+.profile-stats .stat-label { font-size:.8rem; }
+.tender-item { padding:1.2rem 1.3rem; border:1px solid var(--border, #e5e7eb); border-radius:14px; margin-bottom:.75rem; cursor:pointer; transition:border-color .15s, box-shadow .15s; }
+.tender-item:hover { border-color:var(--accent, #5c7c67); box-shadow:0 4px 16px #1b2b2112; }
+.tender-card-top, .detail-title-row, .profile-card-head, .section-heading { display:flex; justify-content:space-between; align-items:start; gap:1rem; }
+.tender-title { font-size:1.08rem; font-weight:700; }
+.tender-meta { display:flex; flex-wrap:wrap; gap:.35rem 1rem; color:var(--muted, #6b7280); font-size:.84rem; margin:.55rem 0; }
+.deadline { white-space:nowrap; color:var(--muted, #6b7280); font-size:.82rem; }
+.deadline-soon { color:var(--danger, #b45309); font-weight:700; }
+.tender-actions { display:flex; gap:.4rem; margin-top:.8rem; }
+.btn-small { padding:.35rem .65rem; font-size:.78rem; }
+.empty-state { text-align:center; padding:3.5rem 1.5rem; color:var(--muted, #6b7280); }
+.empty-state h3 { color:var(--text, #1f2937); margin:.2rem 0 .4rem; }
+.profile-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:1rem; }
+.profile-card { padding:1.25rem; }
+.profile-card h3 { margin:0; }
+.profile-card small { display:block; margin-top:.9rem; color:var(--muted, #6b7280); }
+.profile-actions { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:1.2rem; }
+.profile-form { max-width:680px; margin-top:1.5rem; display:grid; gap:1rem; padding:1.35rem; }
+.profile-form input, .profile-form select { display:block; width:100%; margin-top:.35rem; }
+.form-grid { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+.admin-only { display:none !important; }
+.topbar-actions #status-badge, .topbar-actions #btn-refresh { display:none; }
+.admin-crawl-control { display:grid; gap:1rem; }
+.admin-crawl-head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
+.admin-crawl-status { display:flex; align-items:flex-start; gap:.8rem; }
+.admin-crawl-status strong { display:block; margin-bottom:.15rem; }
+.admin-crawl-status p { margin:0; font-size:.86rem; }
+.admin-crawl-actions { display:flex; align-items:center; flex-wrap:wrap; gap:.7rem; padding-left:calc(.8rem + 91px); }
+.match-reason { color:var(--on-surface-variant); font-size:.82rem; margin-top:.55rem; }
+@media (max-width: 700px) { .inbox-hero, .section-heading { display:block; } .profile-picker-wrap { margin-top:1rem; } .form-grid { grid-template-columns:1fr; } .profile-stats { grid-template-columns:1fr 1fr; } .tender-card-top, .admin-crawl-head { display:block; } .admin-crawl-head > .btn { margin-top:.8rem; } .admin-crawl-actions { padding-left:0; } .deadline { display:block; margin-top:.35rem; } }
 
 .detail-subsection {
   margin: 10px 0;

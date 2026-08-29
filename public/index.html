@@ -10,13 +10,13 @@
   <header class="topbar">
     <h1>🛰️ Tender Crawler</h1>
     <nav class="topnav">
-      <button id="tab-tenders" class="nav-tab active">Ausschreibungen</button>
+      <button id="tab-tenders" class="nav-tab active">Treffer</button>
+      <button id="tab-profiles" class="nav-tab">Suchprofile</button>
+      <button id="tab-admin" class="nav-tab" title="Crawling und Quellen">⚙ Verwaltung</button>
       <button id="tab-funding" class="nav-tab">Förder-Calls</button>
       <button id="tab-funding-chat" class="nav-tab">Förder-Chat</button>
     </nav>
     <div class="topbar-actions">
-      <span id="status-badge" class="badge badge-idle">Bereit</span>
-      <button id="btn-refresh" class="btn" title="Ansicht aktualisieren">⟳</button>
       <button id="btn-logout" class="btn btn-ghost" title="Token zurücksetzen">Logout</button>
     </div>
   </header>
@@ -35,18 +35,34 @@
   </div>
 
   <main id="app" class="hidden">
+    <section class="inbox-hero">
+      <div>
+        <p class="eyebrow">Ausschreibungsfinder</p>
+        <h2 id="active-profile-title">Dein Posteingang</h2>
+        <p id="active-profile-description" class="muted">Wähle ein Suchprofil, um passende Verfahren zu sehen.</p>
+      </div>
+      <div class="profile-picker-wrap">
+        <label for="active-profile">Suchprofil</label>
+        <select id="active-profile"><option value="">Kein Profil ausgewählt</option></select>
+      </div>
+    </section>
+    <section id="inbox-tabs" class="inbox-tabs" aria-label="Trefferansicht">
+      <button class="subtab active" data-inbox-tab="unseen">Neu <span id="count-unseen">0</span></button>
+      <button class="subtab" data-inbox-tab="all">Alle passend <span id="count-all">0</span></button>
+      <button class="subtab" data-inbox-tab="watch">Beobachtet <span id="count-watch">0</span></button>
+    </section>
     <!-- Statistik-Karten -->
-    <section class="stats-grid">
+    <section class="stats-grid profile-stats">
       <div class="card stat-card">
-        <span class="stat-label">Offene Ausschreibungen</span>
+        <span class="stat-label">Neu im Profil</span>
         <span id="stat-total-open" class="stat-value">–</span>
       </div>
       <div class="card stat-card">
-        <span class="stat-label">Neu heute</span>
+        <span class="stat-label">Passend</span>
         <span id="stat-new-today" class="stat-value">–</span>
       </div>
       <div class="card stat-card">
-        <span class="stat-label">Neu (7 Tage)</span>
+        <span class="stat-label">Beobachtet</span>
         <span id="stat-new-7d" class="stat-value">–</span>
       </div>
       <div class="card stat-card">
@@ -63,16 +79,8 @@
       </div>
     </section>
 
-    <!-- Aktionen -->
-    <section class="actions card">
-      <button id="btn-crawl" class="btn btn-primary">Crawl starten</button>
-      <span id="job-status" class="action-msg hidden"></span>
-      <button id="btn-cancel-job" class="btn btn-ghost hidden">Abbruch</button>
-      <span id="action-msg" class="action-msg"></span>
-    </section>
-
     <!-- Filter -->
-    <section class="filters card">
+    <section class="filters card admin-only">
       <input id="filter-q" type="search" placeholder="Suche (Titel, Beschreibung, CPV …)" />
       <select id="filter-source">
         <option value="">Alle Quellen</option>
@@ -100,17 +108,50 @@
     </section>
 
     <!-- Tender-Liste -->
-    <section class="card">
+    <section class="card inbox-results">
       <h2>Ausschreibungen <span id="tender-count" class="count"></span></h2>
       <div id="tender-list" class="tender-list"></div>
       <div id="pagination" class="pagination"></div>
     </section>
 
-    <!-- Crawl-Log -->
-    <section class="card">
-      <h2>Letzte Crawls</h2>
-      <div id="crawl-log" class="crawl-log"></div>
+  </main>
+
+  <main id="profiles-app" class="hidden">
+    <section class="section-heading"><div><p class="eyebrow">Konfiguration</p><h2>Suchprofile</h2><p class="muted">Lege fest, welche Ausschreibungen für dein Büro interessant sind.</p></div><button id="btn-new-profile" class="btn btn-primary">＋ Neues Profil</button></section>
+    <div id="profile-list" class="profile-grid"></div>
+    <form id="profile-form" class="card profile-form hidden">
+      <div class="section-heading"><h3 id="profile-form-title">Neues Suchprofil</h3><button type="button" id="btn-cancel-profile" class="btn btn-ghost">Abbrechen</button></div>
+      <input type="hidden" id="profile-id" />
+      <label>Name<input id="profile-name" required placeholder="z. B. Landschaftsarchitektur NRW" /></label>
+      <label>Suchbegriffe <span class="muted">(mit Komma trennen)</span><input id="profile-keywords" placeholder="Freiraumplanung, Außenanlagen, Spielplatz" /></label>
+      <label>CPV-Codes <span class="muted">(mit Komma trennen)</span><input id="profile-cpvs" placeholder="71420000, 71410000" /></label>
+      <div class="form-grid"><label>Regionen <input id="profile-regions" placeholder="de, bayern, nrw" /></label><label>Quellen <input id="profile-sources" placeholder="ted, evergabe" /></label></div>
+      <div class="form-grid"><label>Status<select id="profile-status"><option value="open">Offen</option><option value="open,closing_soon">Offen und bald fällig</option><option value="open,closing_soon,closed">Alle</option></select></label><label>Mindestvorlauf in Tagen<input id="profile-lead-days" type="number" min="0" placeholder="z. B. 7" /></label></div>
+      <span id="profile-form-error" class="error hidden"></span><button class="btn btn-primary" type="submit">Profil speichern</button>
+    </form>
+  </main>
+
+  <main id="admin-app" class="hidden">
+    <section class="section-heading"><div><p class="eyebrow">Betrieb</p><h2>Verwaltung</h2><p class="muted">Crawling, Quellen und technische Diagnose.</p></div></section>
+    <section class="card admin-crawl-control" aria-live="polite">
+      <div class="admin-crawl-head">
+        <div class="admin-crawl-status">
+          <span id="admin-status-badge" class="badge badge-idle">Bereit</span>
+          <div>
+            <strong id="crawl-status-title">Kein Crawl aktiv</strong>
+            <p id="job-status" class="muted">Die Quellen können manuell aktualisiert werden.</p>
+          </div>
+        </div>
+        <button id="btn-refresh" class="btn btn-ghost" title="Crawl-Status und Verlauf neu laden">⟳ Status prüfen</button>
+      </div>
+      <div class="admin-crawl-actions">
+        <button id="btn-crawl" class="btn btn-primary">Crawl starten</button>
+        <button id="btn-cancel-job" class="btn btn-danger hidden">Crawl abbrechen</button>
+        <span id="action-msg" class="action-msg"></span>
+      </div>
     </section>
+    <section class="card"><h2>Letzte Crawls</h2><div id="crawl-log" class="crawl-log"></div></section>
+    <section class="card"><h2>Quellenstatus</h2><div id="admin-source-list" class="source-list"><p class="muted">Noch nicht geladen.</p></div></section>
   </main>
 
   <!-- ── Förderprogramme ── -->

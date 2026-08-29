@@ -158,9 +158,12 @@ test('dtvp.parseProject überspringt Einträge ohne projectId', () => {
   assert.equal(dtvp.parseProject(null), null);
 });
 
-test('dtvp.fetchDetail liefert null (Anmeldung erforderlich)', async () => {
+test('dtvp.fetchDetail liest den öffentlichen Projektraum als DetailBundle', async () => {
   const detail = await dtvp.fetchDetail('https://www.dtvp.de/notice/123456789');
-  assert.equal(detail, null);
+  assert.ok(detail);
+  assert.equal(detail.detailStatus, 'complete');
+  assert.equal(detail.detailBundle.completeness.sections.communication, 'not_offered');
+  assert.equal(detail.detailBundle.snapshots[0].kind, 'dtvp:overview');
 });
 
 test('bund.fetchDetail liefert Beschreibung und Dokument-URL', async () => {

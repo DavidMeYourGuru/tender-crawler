@@ -9,7 +9,7 @@ process.env.DB_PATH = path.join(tmpDir, 'backfill.sqlite');
 process.env.AUTH_ENABLED = 'false';
 process.env.CRAWL_ON_START = 'false';
 const { db, saveTender, saveSourceDocument, getDocumentChunks, enqueueBrowserJob, finishBrowserJob, backfillSearchText } = await import('../src/db.js');
-const { enqueueDetailBackfillJob, pruneCurrentTenderVersions } = await import('../src/cli-backfill-details.js');
+const { enqueueDetailBackfillJob, pruneCurrentTenderVersions, runResumableHttpBackfill } = await import('../src/cli-backfill-details.js');
 
 after(() => {
   db.close();
@@ -40,5 +40,58 @@ test('Tender-Backfill bleibt idempotent und entfernt alte Tender-Chunks', () => 
   assert.deepEqual(afterSecond, afterFirst);
   assert.equal(afterFirst.docs, 1);
   assert.ok(afterFirst.chunks >= 1);
-  assert.deepEqual(pruneCurrentTenderVersions(['nrw']), { snapshots: 0, sourceDocuments: 0, chunks: 0 });
+  assert.deepEqual(pruneCurrentTenderVersions(['nrw']), { skipped: true, reason: 'historische Versionen bleiben erhalten', sources: ['nrw'] });
+});
+
+test('HTTP-Detail-Backfill verarbeitet den Snapshot trotz Mittelfehler und setzt nur Fehler fort', async () => {
+  const sourceId = 'resume-test';
+  const ids = [1, 2, 3];
+  const states = new Map();
+  const progress = {};
+  const firstCalls = [];
+  const first = await runResumableHttpBackfill(sourceId, {
+    ids,
+    progressState: progress,
+    getTender: (id) => states.get(id),
+    enrich: async ([id]) => { firstCalls.push(id); if (id === 2) throw new Error('simulierter Mittelfehler'); states.set(id, { detail_status: 'complete' }); return 1; },
+  });
+  assert.deepEqual(firstCalls, [1, 2, 3]);
+  assert.equal(first.completed, false);
+  assert.deepEqual(progress[sourceId].successfulIds.sort(), ['1', '3']);
+  assert.deepEqual(progress[sourceId].failedIds, ['2']);
+
+  const secondCalls = [];
+  const resumed = await runResumableHttpBackfill(sourceId, {
+    ids,
+    progressState: progress,
+    getTender: (id) => states.get(id),
+    enrich: async ([id]) => { secondCalls.push(id); states.set(id, { detail_status: 'complete' }); return 1; },
+  });
+  assert.deepEqual(secondCalls, [2]);
+  assert.equal(resumed.completed, true);
+  assert.equal(progress[sourceId], undefined);
+
+  const newRunCalls = [];
+  await runResumableHttpBackfill(sourceId, {
+    ids,
+    progressState: progress,
+    getTender: (id) => states.get(id),
+    enrich: async ([id]) => { newRunCalls.push(id); states.set(id, { detail_status: 'complete' }); return 1; },
+  });
+  assert.deepEqual(newRunCalls, [1, 2, 3]);
+});
+
+test('HTTP-Detail-Backfill erkennt neue Fehler auch bei vorher vollständigem Bestand', async () => {
+  const report = { failed: 0 };
+  const progress = {};
+  const result = await runResumableHttpBackfill('error-delta-test', {
+    ids: [7],
+    progressState: progress,
+    getTender: () => ({ detail_status: 'complete' }),
+    report,
+    enrich: async (_ids, options) => { options.report.failed += 1; return 0; },
+  });
+  assert.equal(result.completed, false);
+  assert.deepEqual(result.failedIds, ['7']);
+  assert.deepEqual(progress['error-delta-test'].failedIds, ['7']);
 });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import config from './config.js';
@@ -6,11 +7,12 @@ import {
   db,
   enqueueBrowserJob,
   getBrowserJobById,
+  getTenderById,
   backfillSearchText,
 } from './db.js';
 import { enrichTenders } from './crawler/orchestrator.js';
 
-const DEFAULT_SOURCES = ['nrw', 'niedersachsen'];
+const DEFAULT_SOURCES = ['ted', 'dtvp', 'evergabe', 'nrw', 'niedersachsen'];
 const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
 let lastReport = null;
 
@@ -20,7 +22,7 @@ function parseSources() {
 }
 
 function printUsage() {
-  console.log(`Verwendung:\n  npm run backfill:details -- [--sources=nrw,niedersachsen]\n  npm run backfill:details -- --dry-run\n\nDer Lauf erstellt eine SQLite-Sicherung und benötigt für Niedersachsen den Browser-Worker.`);
+  console.log(`Verwendung:\n  npm run backfill:details -- [--sources=ted,dtvp,evergabe,nrw,niedersachsen]\n  npm run backfill:details -- --dry-run\n\nDer Lauf erstellt eine SQLite-Sicherung und benötigt für eVergabe/Niedersachsen den Browser-Worker.`);
 }
 
 function sleep(ms) {
@@ -28,36 +30,7 @@ function sleep(ms) {
 }
 
 function pruneCurrentTenderVersions(sourceIds) {
-  const placeholders = sourceIds.map(() => '?').join(',');
-  const ids = db.prepare(`SELECT id FROM tenders WHERE source_id IN (${placeholders})`).all(...sourceIds).map((row) => row.id);
-  if (!ids.length) return { snapshots: 0, sourceDocuments: 0, chunks: 0 };
-  const idPlaceholders = ids.map(() => '?').join(',');
-  const snapshotResult = db.prepare(`
-    DELETE FROM tender_snapshots
-    WHERE tender_id IN (${idPlaceholders})
-      AND id NOT IN (
-        SELECT MAX(id) FROM tender_snapshots
-        WHERE tender_id IN (${idPlaceholders}) GROUP BY tender_id, kind
-      )
-  `).run(...ids, ...ids);
-  const sourceResult = db.prepare(`
-    DELETE FROM source_documents
-    WHERE doc_kind = 'tender' AND entity_id IN (${idPlaceholders})
-      AND id NOT IN (
-        SELECT MAX(id) FROM source_documents
-        WHERE doc_kind = 'tender' AND entity_id IN (${idPlaceholders}) GROUP BY entity_id
-      )
-  `).run(...ids, ...ids);
-  const chunkResult = db.prepare(`
-    DELETE FROM document_chunks
-    WHERE doc_kind = 'tender' AND entity_id IN (${idPlaceholders})
-      AND NOT EXISTS (
-        SELECT 1 FROM source_documents sd
-        WHERE sd.doc_kind = 'tender' AND sd.entity_id = document_chunks.entity_id
-          AND sd.doc_version = document_chunks.doc_version
-      )
-  `).run(...ids);
-  return { snapshots: snapshotResult.changes, sourceDocuments: sourceResult.changes, chunks: chunkResult.changes };
+  return { skipped: true, reason: 'historische Versionen bleiben erhalten', sources: [...sourceIds] };
 }
 
 function sourceMetrics(sourceIds) {
@@ -103,6 +76,96 @@ export function enqueueDetailBackfillJob(sourceId = 'niedersachsen') {
   return job;
 }
 
+function progressFilePath() {
+  return path.join(path.dirname(config.dbPath), 'tender-detail-backfill-progress.json');
+}
+
+function loadProgress(filePath = progressFilePath()) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveProgress(progress, filePath = progressFilePath()) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.tmp`;
+  fs.writeFileSync(temporaryPath, JSON.stringify(progress, null, 2), 'utf8');
+  fs.renameSync(temporaryPath, filePath);
+}
+
+/**
+ * HTTP-Detailbackfills arbeiten mit einem Snapshot und getrennten Erfolgs-
+ * und Fehlerlisten. Dadurch blockiert ein fehlerhafter Tender die nachfolgenden
+ * nicht, und ein erneuter Lauf fragt nur offene bzw. fehlgeschlagene IDs ab.
+ * Nach einem vollständig erfolgreichen Lauf wird der Fortschritt entfernt,
+ * damit ein bewusst neu gestarteter Backfill einen neuen Snapshot bildet.
+ */
+export async function runResumableHttpBackfill(sourceId, {
+  report = { failed: 0 },
+  ids = null,
+  enrich = enrichTenders,
+  getTender = getTenderById,
+  progressState = null,
+  progressPath = progressFilePath(),
+} = {}) {
+  const progress = progressState || loadProgress(progressPath);
+  const rows = ids || db.prepare('SELECT id FROM tenders WHERE source_id = ? ORDER BY id').all(sourceId).map((row) => row.id);
+  const currentIds = rows.map((id) => String(id));
+  const sourceProgress = progress[sourceId] || null;
+  const successfulIds = new Set((sourceProgress?.successfulIds || []).map(String));
+  const failedIds = new Set((sourceProgress?.failedIds || []).map(String));
+  const snapshotIds = new Set([...(sourceProgress?.snapshotIds || []).map(String), ...currentIds]);
+  const pending = rows.filter((id) => !successfulIds.has(String(id)) || failedIds.has(String(id)));
+  const persist = () => {
+    if (!progressState) saveProgress(progress, progressPath);
+  };
+  if (!pending.length && sourceProgress) {
+    delete progress[sourceId];
+    persist();
+    return { enriched: 0, completed: true, resumedFrom: sourceProgress.snapshotIds || [], successfulIds: [...successfulIds], failedIds: [] };
+  }
+
+  if (!pending.length) return { enriched: 0, completed: true, resumedFrom: [], successfulIds: currentIds, failedIds: [] };
+  let enriched = 0;
+  for (const tenderId of pending) {
+    const id = String(tenderId);
+    const failedBefore = Number(report.failed || 0);
+    let count = 0;
+    let thrown = null;
+    try {
+      count = await enrich([tenderId], { force: true, report });
+    } catch (error) {
+      thrown = error;
+      if (Number(report.failed || 0) <= failedBefore) report.failed = failedBefore + 1;
+    }
+    const failedDelta = Number(report.failed || 0) - failedBefore;
+    const stored = getTender(tenderId);
+    const successful = !thrown && failedDelta <= 0 && stored?.detail_status === 'complete';
+    if (successful) {
+      successfulIds.add(id);
+      failedIds.delete(id);
+      enriched += Number(count || 0);
+    } else {
+      successfulIds.delete(id);
+      failedIds.add(id);
+    }
+    progress[sourceId] = {
+      snapshotIds: [...snapshotIds], successfulIds: [...successfulIds], failedIds: [...failedIds],
+      updatedAt: new Date().toISOString(),
+    };
+    persist();
+  }
+  if (failedIds.size) {
+    return { enriched, completed: false, resumedFrom: sourceProgress?.snapshotIds || [], successfulIds: [...successfulIds], failedIds: [...failedIds] };
+  }
+  delete progress[sourceId];
+  persist();
+  return { enriched, completed: true, resumedFrom: sourceProgress?.snapshotIds || [], successfulIds: [...successfulIds], failedIds: [] };
+}
+
 async function waitForBrowserJob(jobId) {
   const deadline = Date.now() + config.browserJobTimeoutMs + 120000;
   while (Date.now() < deadline) {
@@ -119,7 +182,7 @@ async function main() {
     return;
   }
   const sourceIds = parseSources();
-  const unknown = sourceIds.filter((sourceId) => !['nrw', 'niedersachsen'].includes(sourceId));
+  const unknown = sourceIds.filter((sourceId) => !['ted', 'dtvp', 'evergabe', 'nrw', 'niedersachsen'].includes(sourceId));
   if (unknown.length) throw new Error(`Nicht unterstützte Detailquelle(n): ${unknown.join(', ')}`);
 
   if (process.argv.includes('--dry-run')) {
@@ -133,29 +196,33 @@ async function main() {
   await db.backup(backupPath);
   console.log(`[detail-backfill] Sicherung: ${backupPath}`);
 
-  const report = lastReport = { sources: sourceIds, status: 'running', nrwEnriched: 0, niedersachsenJob: null, pruned: null, metrics: null, error: null };
-  if (sourceIds.includes('nrw')) {
-    const rows = db.prepare(`SELECT id FROM tenders WHERE source_id = 'nrw' ORDER BY id`).all();
-    report.nrw = { failed: 0, metrics: null };
-    report.nrwEnriched = await enrichTenders(rows.map((row) => row.id), { force: true, report: report.nrw });
-    if (report.nrw.failed > 0) {
-      throw new Error(`NRW-Detail-Backfill: ${report.nrw.failed} Detailabrufe fehlgeschlagen.`);
-    }
+  const report = lastReport = { sources: sourceIds, status: 'running', enriched: {}, jobs: {}, nrwEnriched: 0, niedersachsenJob: null, pruned: null, metrics: null, error: null };
+  for (const sourceId of sourceIds.filter((id) => !['evergabe', 'niedersachsen'].includes(id))) {
+    report[sourceId] = { failed: 0, metrics: null };
+    const result = await runResumableHttpBackfill(sourceId, { report: report[sourceId] });
+    report.enriched[sourceId] = result.enriched;
+    report.resume = report.resume || {};
+    report.resume[sourceId] = result;
+    if (sourceId === 'nrw') report.nrwEnriched = report.enriched[sourceId];
   }
-  if (sourceIds.includes('niedersachsen')) {
-    const job = enqueueDetailBackfillJob('niedersachsen');
-    report.niedersachsenJob = await waitForBrowserJob(job.id);
-    if (report.niedersachsenJob.status !== 'completed') {
-      throw new Error(`Niedersachsen-Backfill ${job.id} endete mit Status ${report.niedersachsenJob.status}: ${report.niedersachsenJob.error_detail || 'unbekannter Fehler'}`);
-    }
+  for (const sourceId of sourceIds.filter((id) => ['evergabe', 'niedersachsen'].includes(id))) {
+    const job = enqueueDetailBackfillJob(sourceId);
+    report.jobs[sourceId] = await waitForBrowserJob(job.id);
+    if (sourceId === 'niedersachsen') report.niedersachsenJob = report.jobs[sourceId];
+    if (report.jobs[sourceId].status !== 'completed') throw new Error(`${sourceId}-Backfill ${job.id} endete mit Status ${report.jobs[sourceId].status}: ${report.jobs[sourceId].error_detail || 'unbekannter Fehler'}`);
   }
   report.metrics = sourceMetrics(sourceIds);
   report.search = { updated: backfillSearchText() };
-  if (!report.metrics.complete) {
+  const httpBackfillFailed = sourceIds.filter((sourceId) => !['evergabe', 'niedersachsen'].includes(sourceId))
+    .some((sourceId) => Number(report[sourceId]?.failed || 0) > 0 || report.resume?.[sourceId]?.completed === false);
+  if (!report.metrics.complete || httpBackfillFailed) {
     report.status = 'partial';
     report.pruned = { skipped: true, reason: 'unvollständige oder fehlerhafte Detailergebnisse' };
   } else {
-    report.pruned = pruneCurrentTenderVersions(sourceIds);
+    // Historische Snapshots, Dokumentversionen und Chunks bleiben erhalten.
+    // Die frühere Bereinigung ist weiterhin als expliziter Export verfügbar,
+    // wird vom Backfill aber niemals automatisch ausgeführt.
+    report.pruned = { skipped: true, reason: 'historische Versionen bleiben erhalten' };
     report.status = 'complete';
   }
   console.log(JSON.stringify(report, null, 2));

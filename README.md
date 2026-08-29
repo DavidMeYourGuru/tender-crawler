@@ -17,9 +17,9 @@ Crawler für deutsche und europäische Ausschreibungsportale mit LLM-Analyse und
 
 | Portal | Status | Hinweis |
 |---|---|---|
-| **TED (EU)** | Aktiv | Offizielle eSearch-API (`api.ted.europa.eu/v3`), bis zu 250 Treffer pro Abruf; deckt EU-weite Ausschreibungen inkl. deutscher Vergaben oberhalb der EU-Schwellenwerte ab |
-| **DTVP (Deutsches Vergabeportal)** | Aktiv | Zugriff über die interne JSON-API (`/Center/api/v2/project/search`) mit JWT-Authentifizierung; liefert laufende Ausschreibungen mit Frist, Vergabestelle und Vergabeart |
-| **eVergabe Online** | Aktiv | Vergabeplattform des Bundes (`evergabe-online.de`). Die Wicket-JS-Oberfläche wird von einem **separaten Playwright-Worker** vollständig paginiert (100 Treffer/Seite, automatischer Initialimport + inkrementelle Aktualisierung) |
+| **TED (EU)** | Aktiv | Offizielle Search API (`api.ted.europa.eu/v3`) mit vollständiger Iteration; nur Competition-/Change-Bekanntmachungen, XML-Rohsnapshot und normalisierte Lose/Kriterien/Dokumentlinks |
+| **DTVP (Deutsches Vergabeportal)** | Aktiv | Discovery über die JSON-API; öffentliche Satellite-Seiten (`processdata/eforms`, Dokumente und anonyme Kommunikation) werden als DetailBundle inkl. Roh-HTML inventarisiert |
+| **eVergabe Online** | Aktiv | Vergabeplattform des Bundes (`evergabe-online.de`). Die Wicket-JS-Oberfläche wird von einem **separaten Playwright-Worker** vollständig paginiert; Bekanntmachungsseite, XML und `tenderdocuments` werden ergänzt, verlinkte Binärdateien nur inventarisiert |
 | **bund.de** | Deaktiviert | leitet auf die eVergabe-Plattform weiter → Daten sind über die Quelle `evergabe` abgedeckt |
 | **Vergabe Bayern** | Deaktiviert | Portal geschlossen; Vergaben erscheinen heute auf `portal.deutsche-evergabe.de` (nur über Browser erreichbar) |
 
@@ -31,13 +31,13 @@ Die eVergabe-Plattform lädt ihre Ergebnisse per Wicket-JavaScript – ohne Brow
 10 neuesten Treffer verfügbar. Der Crawler löst das mit einem eigenen Worker-Prozess:
 
 ```
-npm run worker        # Playwright-Worker starten (getrennt vom API-Server)
+npm run worker        # optional: Playwright-Worker separat starten
 ```
 
 ### Ablauf
 1. `POST /api/crawl` reiht Browser-Quellen sofort als persistenten Job in die SQLite-Queue
    (`crawl_jobs`) ein – die API-Antwort kommt umgehend, direkte Quellen (TED/DTVP) laufen asynchron.
-2. Der Worker claimt den Job atomar, startet ein persistentes anonymes Chromium-Profil
+2. Der mit dem Server gestartete Worker claimt den Job atomar, startet ein persistentes anonymes Chromium-Profil
    (`data/browser-profiles/evergabe`) und öffnet die eVergabe-Suche.
 3. Er setzt die Seitengröße auf 100 und traversiert die Ergebnisliste über die Wicket-Pagination.
 4. Neue Tender werden gespeichert und anschließend über die Detailseiten mit Beschreibungen
@@ -177,8 +177,8 @@ Alle Endpunkte außer `/api/health` erfordern den Header `Authorization: Bearer 
 Tender-Details enthalten zusätzlich aktuelle `text_sections` (bereinigter Seitenklartext),
 generische `facts` sowie das Dokumentinventar. Dokumentdateien werden beim Crawl nicht
 geladen. Eine kontrollierte Nachanreicherung des Bestands startet mit
-`npm run backfill:details -- --sources=nrw,niedersachsen`; der Lauf erstellt vorher eine
-SQLite-Sicherung und benötigt für Niedersachsen den Browser-Worker.
+`npm run backfill:details -- --sources=ted,dtvp,evergabe,nrw,niedersachsen`; der Lauf erstellt vorher eine
+SQLite-Sicherung, paginiert TED vollständig, reichert DTVP direkt an und benötigt für eVergabe/Niedersachsen den Browser-Worker.
 
 ## Verwaltete Quellen & RAG
 

@@ -6,6 +6,7 @@ import {
   finishBrowserJob,
   requestCancelJob,
   recoverStaleJobs,
+  getBrowserJobById,
   getCrawlSource,
   getCrawlSourceByKey,
 } from './db.js';
@@ -34,6 +35,14 @@ function resolveRunner(job) {
 
 let shuttingDown = false;
 let currentJobId = null;
+let workerLoopPromise = null;
+let signalHandlersInstalled = false;
+
+function refreshCancellation(job) {
+  const current = getBrowserJobById(job.id);
+  job.cancel_requested = current?.cancel_requested ? 1 : 0;
+  return Boolean(job.cancel_requested);
+}
 
 /**
  * Führt einen übernommenen Browser-Job mit Heartbeat, Retry und
@@ -48,6 +57,7 @@ async function runJob(job) {
 
   let lastProgress = {};
   const heartbeat = setInterval(() => {
+    refreshCancellation(job);
     updateJobProgress(job.id, lastProgress);
   }, config.workerHeartbeatMs);
 
@@ -55,6 +65,7 @@ async function runJob(job) {
     const result = await runner({
       job,
       onProgress: (progress) => {
+        const cancellationRequested = refreshCancellation(job);
         lastProgress = {
           pagesDone: progress.pagesDone,
           itemsDiscovered: progress.itemsDiscovered,
@@ -62,6 +73,9 @@ async function runJob(job) {
           itemsChanged: progress.itemsChanged,
         };
         updateJobProgress(job.id, lastProgress);
+        if (cancellationRequested) {
+          throw Object.assign(new Error('Job wurde abgebrochen'), { cancelled: true });
+        }
         console.log(
           `[worker] ${job.source_id}: Seite ${progress.pageNumber ?? progress.pagesDone}, ` +
           `${progress.itemsDiscovered} Treffer, ${progress.itemsNew} neu, ${progress.itemsChanged} geändert ` +
@@ -70,23 +84,28 @@ async function runJob(job) {
       },
     });
 
-    completeBrowserJob(job.id, {
-      pagesDone: result.pagesDone,
-      itemsDiscovered: result.itemsDiscovered,
-      itemsNew: result.itemsNew,
-      itemsChanged: result.itemsChanged,
-    });
-    console.log(`[worker] Job ${job.id} abgeschlossen (${job.source_id}): ${result.itemsDiscovered} Treffer, ${result.itemsNew} neu.`);
+    if (refreshCancellation(job)) {
+      finishBrowserJob(job.id, 'cancelled', { ...lastProgress, error: 'Job wurde abgebrochen' });
+      console.log(`[worker] Job ${job.id} abgebrochen.`);
+    } else {
+      completeBrowserJob(job.id, {
+        pagesDone: result.pagesDone,
+        itemsDiscovered: result.itemsDiscovered,
+        itemsNew: result.itemsNew,
+        itemsChanged: result.itemsChanged,
+      });
+      console.log(`[worker] Job ${job.id} abgeschlossen (${job.source_id}): ${result.itemsDiscovered} Treffer, ${result.itemsNew} neu.`);
+    }
   } catch (error) {
     const cancelled = Boolean(error.cancelled) || error.name === 'CanceledError';
     if (cancelled) {
-      finishBrowserJob(job.id, 'cancelled', { error: error.message });
+      finishBrowserJob(job.id, 'cancelled', { ...lastProgress, error: error.message });
       console.log(`[worker] Job ${job.id} abgebrochen.`);
     } else if (job.attempt >= job.max_attempts) {
-      finishBrowserJob(job.id, 'failed', { error: error.message });
+      finishBrowserJob(job.id, 'failed', { ...lastProgress, error: error.message });
       console.error(`[worker] Job ${job.id} endgültig fehlgeschlagen:`, error.message);
     } else {
-      finishBrowserJob(job.id, 'retry', { error: error.message });
+      finishBrowserJob(job.id, 'retry', { ...lastProgress, error: error.message });
       console.warn(`[worker] Job ${job.id} auf Retry gesetzt (Versuch ${job.attempt}/${job.max_attempts}):`, error.message);
     }
   } finally {
@@ -124,13 +143,22 @@ function shutdown(signal) {
   setTimeout(() => process.exit(0), 5000).unref();
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-if (!config.browserWorkerEnabled) {
-  console.log('[worker] Deaktiviert (BROWSER_WORKER_ENABLED=false).');
-  process.exit(0);
+export function startWorker() {
+  if (!config.browserWorkerEnabled) {
+    console.log('[worker] Deaktiviert (BROWSER_WORKER_ENABLED=false).');
+    return null;
+  }
+  if (workerLoopPromise) return workerLoopPromise;
+  shuttingDown = false;
+  if (!signalHandlersInstalled) {
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    signalHandlersInstalled = true;
+  }
+  console.log(`[worker] ${config.workerId} startet (Polling ${config.workerPollIntervalMs}ms, Runner: ${Object.keys(runners).join(', ')})`);
+  workerLoopPromise = loop().finally(() => { workerLoopPromise = null; });
+  return workerLoopPromise;
 }
 
-console.log(`[worker] ${config.workerId} startet (Polling ${config.workerPollIntervalMs}ms, Runner: ${Object.keys(runners).join(', ')})`);
-loop();
+const isDirectRun = process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+if (isDirectRun) startWorker();

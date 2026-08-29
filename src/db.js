@@ -335,6 +335,14 @@ CREATE TABLE IF NOT EXISTS tender_migration_log (
   status TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- Persönliche Zustände pro Ausschreibung (Inbox-Aktionen)
+CREATE TABLE IF NOT EXISTS tender_user_states (
+  tender_id INTEGER PRIMARY KEY REFERENCES tenders(id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'unseen' CHECK (state IN ('unseen', 'seen', 'watch', 'dismiss')),
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tender_user_states_state ON tender_user_states(state);
 `);
 
 // FTS5 Volltextsuche – muss nach dem Erstellen von tenders ausgeführt werden.
@@ -681,6 +689,8 @@ ensureColumn('crawl_log', 'documents_inventoried', 'INTEGER NOT NULL DEFAULT 0')
 ensureColumn('crawl_log', 'messages_inventoried', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('crawl_log', 'login_required', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('crawl_log', 'unknown_portal_structure', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('saved_searches', 'min_lead_days', 'INTEGER');
+ensureColumn('saved_searches', 'updated_at', 'TEXT');
 
 // Bestehende Installationen haben einen FTS5-Index ohne `search_text_full`.
 // FTS5 kann Spalten nicht per ALTER TABLE erweitern; der abgeleitete Index
@@ -1037,12 +1047,23 @@ export const stmts = {
     WHERE analyzed_at >= ? AND success = 1
   `),
   insertSavedSearch: db.prepare(`
-    INSERT INTO saved_searches (name, keywords, cpv_codes, sources, regions, status_filter, min_relevance, notify_email, active, created_at)
-    VALUES (@name, @keywords, @cpv_codes, @sources, @regions, @status_filter, @min_relevance, @notify_email, 1, @created_at)
+    INSERT INTO saved_searches (name, keywords, cpv_codes, sources, regions, status_filter, min_relevance, min_lead_days, notify_email, active, created_at, updated_at)
+    VALUES (@name, @keywords, @cpv_codes, @sources, @regions, @status_filter, @min_relevance, @min_lead_days, @notify_email, 1, @created_at, @created_at)
   `),
   allSavedSearches: db.prepare(`SELECT * FROM saved_searches ORDER BY created_at DESC`),
   getSavedSearch: db.prepare(`SELECT * FROM saved_searches WHERE id = ?`),
+  updateSavedSearch: db.prepare(`
+    UPDATE saved_searches SET name=@name, keywords=@keywords, cpv_codes=@cpv_codes,
+      sources=@sources, regions=@regions, status_filter=@status_filter,
+      min_relevance=@min_relevance, min_lead_days=@min_lead_days,
+      active=@active, updated_at=@updated_at WHERE id=@id
+  `),
   deleteSavedSearch: db.prepare(`DELETE FROM saved_searches WHERE id = ?`),
+  getTenderState: db.prepare(`SELECT state, updated_at FROM tender_user_states WHERE tender_id = ?`),
+  setTenderState: db.prepare(`
+    INSERT INTO tender_user_states (tender_id, state, updated_at) VALUES (@tender_id, @state, @updated_at)
+    ON CONFLICT(tender_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at
+  `),
   getCrawlLogs: db.prepare(`
     SELECT cl.*, s.name AS source_name,
       CASE WHEN cl.finished_at IS NOT NULL AND cl.started_at IS NOT NULL
@@ -1094,7 +1115,7 @@ export const stmts = {
       pages_done = @pages_done, items_discovered = @items_discovered,
       items_new = @items_new, items_changed = @items_changed,
       error_detail = NULL
-    WHERE id = @id
+    WHERE id = @id AND status IN ('queued', 'running', 'retry') AND cancel_requested = 0
   `),
   finishBrowserJob: db.prepare(`
     UPDATE crawl_jobs SET
@@ -1105,9 +1126,22 @@ export const stmts = {
     WHERE id = @id
   `),
   requestCancel: db.prepare(`UPDATE crawl_jobs SET cancel_requested = 1 WHERE id = ?`),
+  cancelInactiveJob: db.prepare(`
+    UPDATE crawl_jobs SET
+      status = 'cancelled', finished_at = @now, heartbeat_at = @now,
+      locked_by = NULL, error_detail = @error
+    WHERE id = @id AND (
+      status IN ('queued', 'retry') OR
+      (status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < @stale))
+    )
+  `),
   recoverStaleJobs: db.prepare(`
     UPDATE crawl_jobs SET
-      status = 'retry', heartbeat_at = @now, error_detail = @error
+      status = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'retry' END,
+      finished_at = CASE WHEN cancel_requested = 1 THEN @now ELSE NULL END,
+      heartbeat_at = @now,
+      locked_by = NULL,
+      error_detail = CASE WHEN cancel_requested = 1 THEN @cancel_error ELSE @error END
     WHERE status = 'running' AND heartbeat_at < @stale
   `),
   getRecentJobs: db.prepare(`
@@ -1252,6 +1286,8 @@ export function listTenders({
   valueMaxCents = null,
   relevanceMin = null,
   analyzedOnly = false,
+  profileId = null,
+  userState = null,
   sort = 'newest',
   page = 1,
   limit = 25,
@@ -1290,8 +1326,11 @@ export function listTenders({
   }
 
   if (cpv) {
-    conditions.push(`t.cpv_codes LIKE @cpv_pattern`);
-    params.cpv_pattern = `%"${cpv}%`;
+    const cpvs = Array.isArray(cpv) ? cpv : String(cpv).split(',').map((value) => value.trim()).filter(Boolean);
+    if (cpvs.length) {
+      conditions.push(`(${cpvs.map((_, index) => `t.cpv_codes LIKE @cpv_${index}`).join(' OR ')})`);
+      cpvs.forEach((value, index) => { params[`cpv_${index}`] = `%"${value}%`; });
+    }
   }
 
   if (deadlineBefore) {
@@ -1323,6 +1362,41 @@ export function listTenders({
     conditions.push(`t.llm_analyzed_at IS NOT NULL`);
   }
 
+  if (profileId != null) {
+    const profile = stmts.getSavedSearch.get(Number(profileId));
+    if (!profile) {
+      // Nie ungefiltert auf einen unbekannten/stale Profilverweis zurückfallen.
+      conditions.push('1 = 0');
+    } else {
+      const profileKeywords = profile.keywords ? String(profile.keywords).split(/[,\n]+/).map((value) => value.trim()).filter(Boolean) : [];
+      const profileCpvs = profile.cpv_codes ? safeParseJson(profile.cpv_codes) : [];
+      const profileSources = profile.sources ? safeParseJson(profile.sources) : [];
+      const profileRegions = profile.regions ? safeParseJson(profile.regions) : [];
+      if (profileKeywords.length) {
+        conditions.push(`(${profileKeywords.map((_, index) => `LOWER(COALESCE(t.search_text_full, '')) LIKE @profile_keyword_${index}`).join(' OR ')})`);
+        profileKeywords.forEach((value, index) => { params[`profile_keyword_${index}`] = `%${value.toLowerCase().replace(/[%_]/g, '')}%`; });
+      }
+      if (profileCpvs?.length) {
+        conditions.push(`(${profileCpvs.map((_, index) => `t.cpv_codes LIKE @profile_cpv_${index}`).join(' OR ')})`);
+        profileCpvs.forEach((value, index) => { params[`profile_cpv_${index}`] = `%"${value}%`; });
+      }
+      if (profileSources?.length) sourceSql += ` AND t.source_id IN (${profileSources.map((s) => `'${escapeSql(s)}'`).join(', ')})`;
+      if (profileRegions?.length) sourceSql += ` AND s.region IN (${profileRegions.map((r) => `'${escapeSql(r)}'`).join(', ')})`;
+      if (profile.status_filter) sourceSql += ` AND t.status IN (${String(profile.status_filter).split(',').map((s) => `'${escapeSql(s.trim())}'`).join(', ')})`;
+      if (profile.min_lead_days != null) {
+        const date = new Date(Date.now() + Number(profile.min_lead_days) * 86400000).toISOString().slice(0, 10);
+        conditions.push(`(t.submission_deadline IS NULL OR t.submission_deadline >= @profile_min_deadline)`);
+        params.profile_min_deadline = date;
+      }
+    }
+  }
+  if (userState === 'watch' || userState === 'dismiss' || userState === 'seen' || userState === 'unseen') {
+    conditions.push(userState === 'unseen' ? `COALESCE(us.state, 'unseen') = 'unseen'` : `us.state = @user_state`);
+    params.user_state = userState;
+  } else {
+    conditions.push(`COALESCE(us.state, 'unseen') != 'dismiss'`);
+  }
+
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const sortClauses = {
@@ -1344,6 +1418,7 @@ export function listTenders({
     SELECT COUNT(*) AS count
     FROM tenders t
     LEFT JOIN sources s ON s.id = t.source_id
+    LEFT JOIN tender_user_states us ON us.tender_id = t.id
     ${finalWhere}
   `).get(params);
 
@@ -1352,9 +1427,11 @@ export function listTenders({
   const offset = (pageInt - 1) * limitInt;
 
   const rows = db.prepare(`
-    SELECT t.*, s.name AS source_name, s.region AS source_region
+    SELECT t.*, s.name AS source_name, s.region AS source_region,
+      COALESCE(us.state, 'unseen') AS user_state, us.updated_at AS user_state_updated_at
     FROM tenders t
     LEFT JOIN sources s ON s.id = t.source_id
+    LEFT JOIN tender_user_states us ON us.tender_id = t.id
     ${finalWhere}
     ORDER BY ${orderBy}
     LIMIT ${limitInt} OFFSET ${offset}
@@ -1512,6 +1589,13 @@ const saveTenderTx = db.transaction(({ tender, now }) => {
   const detailBundle = tender.detailBundle || tender.bundle || null;
   const metadata = tender.portalMetadata ?? detailBundle?.metadata ?? null;
   const fullCrawlSucceeded = tender.fullCrawlSucceeded ?? detailBundle?.fullCrawlSucceeded ?? false;
+
+  // Ein unvollständiger Folgeabruf darf einen bereits vollständigen Stand
+  // nicht mit einer verkürzten Beschreibung, Metadaten oder Kinddaten
+  // überschreiben. Der nächste fällige Vollabruf versucht es erneut.
+  if (existing?.detail_status === 'complete' && detailBundle && detailBundle.fullCrawlSucceeded === false) {
+    return { isNew: false, changed: false, tenderId: existing.id, changes: [] };
+  }
 
   const completenessInput = tender.detailCompleteness ?? detailBundle?.completeness ?? null;
   const effective = {
@@ -2249,16 +2333,18 @@ export function countLlmAnalysesToday() {
 }
 
 export function createSavedSearch(data) {
+  const now = new Date().toISOString();
   const result = stmts.insertSavedSearch.run({
-    name: data.name,
+    name: String(data.name || 'Unbenanntes Suchprofil').trim(),
     keywords: data.keywords ?? null,
     cpv_codes: data.cpvCodes ? JSON.stringify(data.cpvCodes) : null,
     sources: data.sources ? JSON.stringify(data.sources) : null,
     regions: data.regions ? JSON.stringify(data.regions) : null,
     status_filter: data.statusFilter || 'open',
     min_relevance: data.minRelevance ?? null,
+    min_lead_days: data.minLeadDays ?? data.min_lead_days ?? null,
     notify_email: data.notifyEmail ?? null,
-    created_at: new Date().toISOString(),
+    created_at: now,
   });
   return stmts.getSavedSearch.get(Number(result.lastInsertRowid));
 }
@@ -2269,6 +2355,45 @@ export function getSavedSearches() {
 
 export function deleteSavedSearch(id) {
   stmts.deleteSavedSearch.run(id);
+}
+
+export function updateSavedSearch(id, data) {
+  const existing = stmts.getSavedSearch.get(Number(id));
+  if (!existing) return null;
+  const updatedAt = new Date().toISOString();
+  stmts.updateSavedSearch.run({
+    id: Number(id),
+    name: String(data.name ?? existing.name).trim() || existing.name,
+    keywords: Object.prototype.hasOwnProperty.call(data, 'keywords') ? (data.keywords || null) : existing.keywords,
+    cpv_codes: Object.prototype.hasOwnProperty.call(data, 'cpvCodes') ? (data.cpvCodes?.length ? JSON.stringify(data.cpvCodes) : null) : existing.cpv_codes,
+    sources: Object.prototype.hasOwnProperty.call(data, 'sources') ? (data.sources?.length ? JSON.stringify(data.sources) : null) : existing.sources,
+    regions: Object.prototype.hasOwnProperty.call(data, 'regions') ? (data.regions?.length ? JSON.stringify(data.regions) : null) : existing.regions,
+    status_filter: data.statusFilter ?? existing.status_filter ?? 'open',
+    min_relevance: Object.prototype.hasOwnProperty.call(data, 'minRelevance') ? (data.minRelevance ?? null) : (existing.min_relevance ?? null),
+    min_lead_days: Object.prototype.hasOwnProperty.call(data, 'minLeadDays') || Object.prototype.hasOwnProperty.call(data, 'min_lead_days')
+      ? (data.minLeadDays ?? data.min_lead_days ?? null) : (existing.min_lead_days ?? null),
+    active: data.active === undefined ? existing.active : (data.active ? 1 : 0),
+    updated_at: updatedAt,
+  });
+  return stmts.getSavedSearch.get(Number(id));
+}
+
+export function getTenderUserState(tenderId) {
+  return stmts.getTenderState.get(Number(tenderId)) || { state: 'unseen', updated_at: null };
+}
+
+export function setTenderUserState(tenderId, state) {
+  const valid = ['unseen', 'seen', 'watch', 'dismiss'];
+  if (!valid.includes(state)) throw new Error(`Ungültiger Ausschreibungsstatus: ${state}`);
+  stmts.setTenderState.run({ tender_id: Number(tenderId), state, updated_at: new Date().toISOString() });
+  return getTenderUserState(tenderId);
+}
+
+export function getSearchProfileCounts(profileId) {
+  const base = listTenders({ profileId, limit: 1 });
+  const watch = listTenders({ profileId, userState: 'watch', limit: 1 });
+  const unseen = listTenders({ profileId, userState: 'unseen', limit: 1 });
+  return { total: base.total, watch: watch.total, unseen: unseen.total };
 }
 
 export function getCrawlHistory(limit = 10) {
@@ -2414,6 +2539,15 @@ export function finishBrowserJob(id, status, { pagesDone, itemsDiscovered, items
 
 export function requestCancelJob(id) {
   stmts.requestCancel.run(id);
+  const now = new Date().toISOString();
+  const stale = new Date(Date.now() - config.workerStaleAfterMs).toISOString();
+  stmts.cancelInactiveJob.run({
+    id,
+    now,
+    stale,
+    error: 'Abgebrochen (Job war nicht mehr aktiv)',
+  });
+  return stmts.getBrowserJobById.get(id) || null;
 }
 
 /**
@@ -2422,7 +2556,12 @@ export function requestCancelJob(id) {
  */
 export function recoverStaleJobs(now = new Date().toISOString(), staleMs = 60000) {
   const stale = new Date(Date.now() - staleMs).toISOString();
-  const info = stmts.recoverStaleJobs.run({ now, stale, error: 'stale (Worker nicht mehr erreichbar)' });
+  const info = stmts.recoverStaleJobs.run({
+    now,
+    stale,
+    error: 'stale (Worker nicht mehr erreichbar)',
+    cancel_error: 'Abgebrochen (Worker nicht mehr erreichbar)',
+  });
   return info.changes;
 }
 
@@ -3695,8 +3834,12 @@ export default {
   countLlmAnalysesToday,
   getTendersForLlmAnalysis,
   createSavedSearch,
+  updateSavedSearch,
   getSavedSearches,
   deleteSavedSearch,
+  getTenderUserState,
+  setTenderUserState,
+  getSearchProfileCounts,
   getCrawlHistory,
   getStats,
   enqueueBrowserJob,

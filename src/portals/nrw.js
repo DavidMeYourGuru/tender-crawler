@@ -10,6 +10,11 @@ import { getWithRedirects, httpClient } from '../crawler/http-client.js';
 import { contentHash, normalizeDate, deriveStatus, sleep } from '../utils.js';
 import config from '../config.js';
 import { cleanDetailText, extractFactsFromDom, makeFact, makeTextSection, uniqueFacts } from '../detail-data.js';
+import {
+  parseCosinexCommunicationPage,
+  parseCosinexDocumentsPage,
+  parseCosinexEformsPage,
+} from './cosinex-detail.js';
 
 export const meta = {
   id: 'nrw',
@@ -618,6 +623,10 @@ function parseCriteriaFromText(text) {
  * rawText erhalten, damit spätere Parserergänzungen keine Datenlücke erzeugen. */
 export function parseEformsPage(html, baseUrl = meta.baseUrl) {
   const $ = cheerio.load(html);
+  // Die generische Cosinex-Basis liefert gemeinsame Fallbacks für alle
+  // Installationen. Die NRW-Auswertung darunter bleibt führend und behält
+  // ihre zusätzlichen Flags, NUTS-/Buyer-Felder und den NRW-Snapshot-Kind.
+  const shared = parseCosinexEformsPage(html, baseUrl);
   const lines = bodyLines($);
   const rawText = cleanText(lines.join(' '));
   const cpv = extractCpvDetails(lines.join('\n'));
@@ -686,10 +695,11 @@ export function parseEformsPage(html, baseUrl = meta.baseUrl) {
   };
   return {
     ...core,
-    metadata,
-    lots,
-    criteria,
+    metadata: { ...shared.metadata, ...metadata },
+    lots: lots.length ? lots : shared.lots,
+    criteria: criteria.length ? criteria : shared.criteria,
     facts: uniqueFacts([
+      ...shared.facts,
       ...extractFactsFromDom($, 'eforms', baseUrl),
       ...canonicalStructuredFacts($, 'eforms', baseUrl, metadata),
       ...explicitBooleanFacts($, 'eforms', baseUrl, metadata),
@@ -715,6 +725,7 @@ export function parseEformsPage(html, baseUrl = meta.baseUrl) {
 
 export function parseDocumentsPage(html, baseUrl = meta.baseUrl) {
   const $ = cheerio.load(html);
+  const shared = parseCosinexDocumentsPage(html, baseUrl);
   const pageText = cleanText($('body').text());
   const hasFileLink = $('a[href]').toArray().some((link) => /\.(?:pdf|docx?|xlsx?|zip|odt|txt|xml|html?)(?:$|[?#])/i.test($(link).attr('href') || ''));
   const loginRequired = /(?:login|anmelden|anmeldung erforderlich|nur für registrierte)/i.test(pageText) && !hasFileLink;
@@ -775,9 +786,11 @@ export function parseDocumentsPage(html, baseUrl = meta.baseUrl) {
     try { return new URL(href, baseUrl).toString(); } catch { return null; }
   }).get().filter(Boolean);
   return {
-    documents,
+    documents: [...documents, ...shared.documents.filter((sharedDocument) =>
+      sharedDocument.category !== 'archive' && sharedDocument.mimeType !== 'application/zip' && !/\.zip(?:$|[?#])/i.test(sharedDocument.portalFileId || '') &&
+      !documents.some((document) => document.portalFileId === sharedDocument.portalFileId))],
     archiveUrl: archiveLinks[0] || null,
-    loginRequired,
+    loginRequired: loginRequired || shared.loginRequired,
     textSection: makeTextSection({
       sectionKey: 'documents',
       title: 'Vergabeunterlagen',
@@ -791,6 +804,7 @@ export function parseDocumentsPage(html, baseUrl = meta.baseUrl) {
 
 export function parseCommunicationPage(html, baseUrl = meta.baseUrl) {
   const $ = cheerio.load(html);
+  const shared = parseCosinexCommunicationPage(html, baseUrl);
   const pageText = cleanText(bodyLines($).join(' '));
   const loginRequired = /(?:login|anmelden|anmeldung erforderlich|nur für registrierte)/i.test(pageText)
     && !/(?:Betreff\s*:|Bieterfrage\s*:|Nachricht\s*:)/i.test(pageText);
@@ -839,8 +853,11 @@ export function parseCommunicationPage(html, baseUrl = meta.baseUrl) {
     });
   }
   return {
-    messages,
-    loginRequired,
+    messages: [...messages, ...shared.messages.filter((sharedMessage) =>
+      !messages.some((message) => message.subject === sharedMessage.subject
+        && message.publishedAt === sharedMessage.publishedAt
+        && message.body === sharedMessage.body))],
+    loginRequired: loginRequired || shared.loginRequired,
     textSection: makeTextSection({
       sectionKey: 'communication',
       title: 'Kommunikation',

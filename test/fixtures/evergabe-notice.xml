@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Notice xmlns="urn:evergabe:test" xmlns:efac="urn:evergabe:efac" xmlns:cac="urn:evergabe:cac" xmlns:cbc="urn:evergabe:cbc">
+  <ContractFolderID>EV-2026-01</ContractFolderID><IssueDate>2026-08-01</IssueDate><ProcedureTypeCode>open</ProcedureTypeCode>
+  <efac:Organizations><efac:Organization efac:id="EV-ORG-1"><efac:Company><efac:CompanyName>Bundeslabor Nord</efac:CompanyName><efac:CompanyIdentifier>DE-EV-ORG-1</efac:CompanyIdentifier><efac:PostalAddress><efac:StreetName>Beispielweg 2</efac:StreetName><efac:CityName>Bremen</efac:CityName><efac:PostalZone>28195</efac:PostalZone></efac:PostalAddress><efac:Contact efac:id="EV-TPO-DIRECT"><efac:ContactName>Direkter Kontakt</efac:ContactName><efac:EmailAddress>direkt@example.test</efac:EmailAddress></efac:Contact></efac:Company><efac:TouchPoint efac:id="EV-TPO-1" efac:type="buyer"><efac:ContactName>Max Muster</efac:ContactName><efac:EmailAddress>max@example.test</efac:EmailAddress><efac:Phone>+49 421 555</efac:Phone></efac:TouchPoint></efac:Organization></efac:Organizations>
+  <BuyerCustomerParty><Party><PartyIdentification><ID>EV-ORG-1</ID></PartyIdentification></Party></BuyerCustomerParty>
+  <cac:ContractingParty><cac:Party><cac:PartyIdentification><cbc:ID>EV-ORG-1</cbc:ID></cac:PartyIdentification><cac:Contact><cbc:ID>EV-TPO-1</cbc:ID></cac:Contact></cac:Party></cac:ContractingParty>
+  <TenderingProcess><TenderSubmissionDeadlinePeriod><EndDate>2026-12-15</EndDate><EndTime>12:30:00+01:00</EndTime></TenderSubmissionDeadlinePeriod>
+    <QuestionDeadlinePeriod><EndDate>2026-11-15</EndDate><EndTime>16:00:00+01:00</EndTime></QuestionDeadlinePeriod></TenderingProcess>
+  <ContractDuration><DurationMeasure unitCode="MON">24</DurationMeasure></ContractDuration>
+  <ItemClassificationCode>38000000-5</ItemClassificationCode><ClassificationItem><Name>Laborgeräte</Name></ClassificationItem>
+  <ProcurementProjectLot><ID>1</ID><Name>Analysegeräte</Name><ItemClassificationCode>38434500-1</ItemClassificationCode>
+    <TenderingProcess><TenderSubmissionDeadlinePeriod><EndDate>2026-12-10</EndDate><EndTime>10:15:00+01:00</EndTime></TenderSubmissionDeadlinePeriod></TenderingProcess>
+    <ContractDuration><Period><EndDate>2030-01-01</EndDate></Period></ContractDuration>
+    <AwardingCriterion><Name>Preis</Name><Description>Gesamtpreis</Description><WeightNumeric>70</WeightNumeric></AwardingCriterion></ProcurementProjectLot>
+  <ProcurementProjectLot><ID>2</ID><Name>Wartung</Name><ItemClassificationCode>50400000-9</ItemClassificationCode>
+    <TenderingProcess><TenderSubmissionDeadlinePeriod><EndDate>2026-12-11</EndDate><EndTime>10:15:00+01:00</EndTime></TenderSubmissionDeadlinePeriod></TenderingProcess>
+    <ContractDuration><Period><EndDate>2031-01-01</EndDate></Period></ContractDuration>
+    <AwardingCriterion><Name>Qualität</Name><Description>Servicekonzept</Description><WeightNumeric>30</WeightNumeric></AwardingCriterion></ProcurementProjectLot>
+  <AdditionalDocumentReference><DocumentDescription>Relative Spezifikation</DocumentDescription><Attachment><ExternalReference><URI>files/specification.pdf</URI></ExternalReference></Attachment></AdditionalDocumentReference>
+</Notice>

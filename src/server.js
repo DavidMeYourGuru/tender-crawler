@@ -3,12 +3,14 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import cron from 'node-cron';
 import config, { rootDir } from './config.js';
-import { runCrawl, getCrawlStatus, enrichTenders, enqueueBrowserCrawlJobs } from './crawler/orchestrator.js';
+import { runCrawl, getCrawlStatus, requestCrawlCancel, enrichTenders, enqueueBrowserCrawlJobs } from './crawler/orchestrator.js';
 import {
   getRecentJobs,
   getBrowserJobById,
   requestCancelJob,
+  recoverStaleJobs,
 } from './db.js';
+import { startWorker } from './worker.js';
 import { getAnalysisStatus } from './llm.js';
 import {
   listTenders,
@@ -20,7 +22,11 @@ import {
   getCrawlHistory,
   getSavedSearches,
   createSavedSearch,
+  updateSavedSearch,
   deleteSavedSearch,
+  getTenderUserState,
+  setTenderUserState,
+  getSearchProfileCounts,
   listFundingPrograms,
   getFundingProgramById,
   getFundingStats,
@@ -89,14 +95,18 @@ app.get('/api/health', async () => ({
 /**
  * Aktueller Crawl-Status.
  */
-app.get('/api/status', { preHandler: requireAuth }, async () => ({
-  crawl: getCrawlStatus(),
-  jobs: {
-    active: getRecentJobs(10).filter((j) => ['queued', 'running', 'retry'].includes(j.status)),
-    recent: getRecentJobs(10),
-  },
-  analysis: getAnalysisStatus(),
-}));
+app.get('/api/status', { preHandler: requireAuth }, async () => {
+  recoverStaleJobs(new Date().toISOString(), config.workerStaleAfterMs);
+  const jobs = getRecentJobs(10);
+  return {
+    crawl: getCrawlStatus(),
+    jobs: {
+      active: jobs.filter((j) => ['queued', 'running', 'retry'].includes(j.status)),
+      recent: jobs,
+    },
+    analysis: getAnalysisStatus(),
+  };
+});
 
 /**
  * Abbruch eines laufenden Browser-Jobs.
@@ -107,9 +117,13 @@ app.post('/api/jobs/:id/cancel', { preHandler: requireAuth }, async (request, re
     reply.code(404).send({ error: 'Job nicht gefunden' });
     return reply;
   }
-  requestCancelJob(job.id);
-  return { cancelled: true, jobId: job.id };
+  const updatedJob = requestCancelJob(job.id);
+  return { cancelled: updatedJob?.status === 'cancelled', jobId: job.id, job: updatedJob };
 });
+
+app.post('/api/crawl/cancel', { preHandler: requireAuth }, async () => ({
+  cancelRequested: requestCrawlCancel(),
+}));
 
 /**
  * Startet einen Crawl (optional mit Quellen-Filter).
@@ -156,14 +170,19 @@ app.get('/api/stats', { preHandler: requireAuth }, async () => getStats());
  *        deadline_before, deadline_after, value_min, value_max,
  *        relevance_min, analyzed_only, sort, page, limit
  */
-app.get('/api/tenders', { preHandler: requireAuth }, async (request) => {
+app.get('/api/tenders', { preHandler: requireAuth }, async (request, reply) => {
   const query = request.query || {};
+  if (query.profile_id != null && !getSavedSearches().some((search) => search.id === Number(query.profile_id))) {
+    return reply.code(404).send({ error: 'Suchprofil nicht gefunden' });
+  }
   const result = listTenders({
     q: query.q || null,
     sources: query.sources ? String(query.sources).split(',').map((s) => s.trim()).filter(Boolean) : null,
     regions: query.regions ? String(query.regions).split(',').map((s) => s.trim()).filter(Boolean) : null,
     status: query.status ? String(query.status).split(',').map((s) => s.trim()).filter(Boolean) : null,
     cpv: query.cpv || null,
+    profileId: query.profile_id != null ? Number(query.profile_id) : null,
+    userState: query.user_state || null,
     deadlineBefore: query.deadline_before || null,
     deadlineAfter: query.deadline_after || null,
     valueMinCents: query.value_min != null ? Number(query.value_min) : null,
@@ -178,6 +197,19 @@ app.get('/api/tenders', { preHandler: requireAuth }, async (request) => {
   return { ...result, tenders: result.tenders.map((tender) => ({
     ...tender, url: safeUrl(tender.url), document_url: safeUrl(tender.document_url),
   })) };
+});
+
+app.post('/api/tenders/:id/state', { preHandler: requireAuth }, async (request, reply) => {
+  const tender = getTenderById(Number(request.params.id));
+  if (!tender) return reply.code(404).send({ error: 'Tender nicht gefunden' });
+  try { return setTenderUserState(tender.id, request.body?.state); }
+  catch (error) { return reply.code(400).send({ error: error.message }); }
+});
+
+app.get('/api/tenders/:id/state', { preHandler: requireAuth }, async (request, reply) => {
+  const tender = getTenderById(Number(request.params.id));
+  if (!tender) return reply.code(404).send({ error: 'Tender nicht gefunden' });
+  return getTenderUserState(tender.id);
 });
 
 /**
@@ -215,6 +247,7 @@ app.get('/api/tenders/:id', { preHandler: requireAuth }, async (request, reply) 
   } : null;
   return {
     ...tender,
+    user_state: getTenderUserState(tender.id).state,
     url: safeUrl(tender.url),
     document_url: safeUrl(tender.document_url),
     cpv_codes: tender.cpv_codes ? JSON.parse(tender.cpv_codes) : null,
@@ -253,6 +286,12 @@ app.get('/api/crawls', { preHandler: requireAuth }, async (request) => {
  */
 app.get('/api/searches', { preHandler: requireAuth }, async () => ({ searches: getSavedSearches() }));
 
+app.get('/api/searches/:id/counts', { preHandler: requireAuth }, async (request, reply) => {
+  const id = Number(request.params.id);
+  if (!getSavedSearches().some((search) => search.id === id)) return reply.code(404).send({ error: 'Suchprofil nicht gefunden' });
+  return getSearchProfileCounts(id);
+});
+
 app.post('/api/searches', { preHandler: requireAuth }, async (request, reply) => {
   try {
     const search = createSavedSearch(request.body || {});
@@ -261,6 +300,17 @@ app.post('/api/searches', { preHandler: requireAuth }, async (request, reply) =>
     request.log.error(error);
     reply.code(400).send({ error: error.message });
     return reply;
+  }
+});
+
+app.put('/api/searches/:id', { preHandler: requireAuth }, async (request, reply) => {
+  try {
+    const search = updateSavedSearch(Number(request.params.id), request.body || {});
+    if (!search) return reply.code(404).send({ error: 'Suchprofil nicht gefunden' });
+    return search;
+  } catch (error) {
+    request.log.error(error);
+    return reply.code(400).send({ error: error.message });
   }
 });
 
@@ -629,6 +679,12 @@ if (config.crawlSourcesEnabled && config.crawlSourcesProbeCron) {
  */
 export async function startServer() {
   await app.listen({ port: config.port, host: config.host });
+
+  // Browser-Jobs werden zusammen mit dem API-Server verarbeitet, damit ein
+  // normal gestartetes Dashboard keine unbediente Queue erzeugt.
+  if (config.browserWorkerEnabled) {
+    startWorker()?.catch((error) => app.log.error({ err: error }, 'Browser-Worker beendet'));
+  }
 
   // Quellen-Katalog registrieren
   if (config.crawlSourcesEnabled) {
